@@ -54,3 +54,15 @@ services:
       retries: 30
     # Drain delay + HTTP shutdown + the longest running task must fit.
     stop_grace_period: 60s
+
+  # Scrapes the admin listener and evaluates deploy/prometheus/alerts.yml.
+  # UI: http://localhost:9091 (9090 is taken by the fake gateway).
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    depends_on:
+      payments:
+        condition: service_healthy
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+    ports:
+      - "9091:9090"

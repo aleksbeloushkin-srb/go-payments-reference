@@ -148,8 +148,8 @@ func TestWorkerSettlesEachOutcome(t *testing.T) {
 			if got := testutil.ToFloat64(w.metrics.attempts.WithLabelValues("start_payment", outcome)); got != 1 {
 				t.Fatalf("task_attempts_total{outcome=%q} = %v, want 1", outcome, got)
 			}
-			if n := testutil.CollectAndCount(w.metrics.attempts); n != 1 {
-				t.Fatalf("attempt series = %d, want exactly one outcome recorded", n)
+			if total := attemptsTotal(w.metrics); total != 1 {
+				t.Fatalf("attempts recorded = %v, want exactly one", total)
 			}
 			if got := testutil.ToFloat64(w.metrics.claimed.WithLabelValues("start_payment")); got != 1 {
 				t.Fatalf("tasks_claimed_total = %v, want 1", got)
@@ -183,8 +183,26 @@ func TestWorkerSurvivesLostLease(t *testing.T) {
 	if got := testutil.ToFloat64(w.metrics.leaseLost); got != 1 {
 		t.Fatalf("lease_lost_total = %v, want 1", got)
 	}
-	if n := testutil.CollectAndCount(w.metrics.attempts); n != 0 {
+	if total := attemptsTotal(w.metrics); total != 0 {
 		t.Fatal("a discarded result must not be counted as an attempt")
+	}
+}
+
+// attemptsTotal sums task_attempts_total over every kind and outcome.
+func attemptsTotal(m *Metrics) float64 {
+	var total float64
+	for _, kind := range ports.TaskKinds {
+		for _, o := range []string{outcomeOK, outcomeRetry, outcomePermanent, outcomeDead} {
+			total += testutil.ToFloat64(m.attempts.WithLabelValues(string(kind), o))
+		}
+	}
+	return total
+}
+
+func TestQueueMetricsStartAtZero(t *testing.T) {
+	m := NewMetrics(prometheus.NewRegistry())
+	if n := testutil.CollectAndCount(m.attempts); n != len(ports.TaskKinds)*4 {
+		t.Fatalf("attempt series at start = %d, want every kind and outcome at zero", n)
 	}
 }
 

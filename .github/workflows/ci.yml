@@ -63,5 +63,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: validate Prometheus config and alert rules
+        run: make check-alerts
       - name: build the image and run the end-to-end script with docker compose
         run: ./scripts/e2e.sh

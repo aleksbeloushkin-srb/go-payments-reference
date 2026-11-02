@@ -1,0 +1,96 @@
+# Alert rules for the payment service. docs/OBSERVABILITY.md explains each
+# rule and the first thing to check when it fires.
+#
+# Database gauges (tasks_*, task_oldest_*, outbox_oldest_*) describe the
+# whole database and are exported identically by every instance, so they
+# are aggregated with max(), never sum().
+groups:
+  - name: payments-queue
+    rules:
+      - alert: TaskBacklogStale
+        expr: max(task_oldest_ready_seconds) > 120
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The oldest due task has waited more than two minutes"
+          runbook: "Check that workers run and claim (tasks_claimed_total), and the pool (db_pool_*)."
+      - alert: DeadTasks
+        expr: max by (kind) (tasks_dead) > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Dead {{ $labels.kind }} tasks wait for an operator"
+          runbook: "Read last_error of the dead tasks, fix the cause, then requeue or reconcile with the gateway."
+      - alert: OutboxLag
+        expr: max(outbox_oldest_unpublished_seconds) > 60
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Outbox events are more than a minute old and unpublished"
+          runbook: "Check the relay is running and outbox_failed_total; a failing subscriber blocks the outbox."
+
+  - name: payments-gateway
+    rules:
+      - alert: GatewayAmbiguousRatio
+        expr: |
+          sum by (op) (rate(gateway_requests_total{outcome="ambiguous"}[10m]))
+            / sum by (op) (rate(gateway_requests_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 5% of gateway {{ $labels.op }} calls end with an unknown outcome"
+          runbook: "Check gateway latency and 5xx; payments stay pending and are retried with the same key."
+      - alert: GatewayMisconfigured
+        expr: sum(increase(gateway_requests_total{outcome="misconfigured"}[5m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "The gateway refuses our credentials or URL"
+          runbook: "Check PAYMENTS_GATEWAY_URL and the gateway credentials; affected payments wait in pending."
+
+  - name: payments-http
+    rules:
+      - alert: HTTP5xxRatio
+        expr: |
+          sum(rate(http_requests_total{code=~"5.."}[5m]))
+            / sum(rate(http_requests_total[5m])) > 0.01
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 1% of API requests fail with 5xx"
+          runbook: "Look for 'request failed' errors in the logs, grouped by route; then check the database."
+      - alert: HTTPLatencyP99
+        expr: |
+          histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "p99 latency of {{ $labels.route }} is above one second"
+          runbook: "Long polls are excluded; check pool acquire wait and slow queries."
+
+  - name: payments-db
+    rules:
+      - alert: DBPoolAcquireWait
+        expr: |
+          sum(rate(db_pool_acquire_wait_seconds_total[5m]))
+            / sum(rate(db_pool_acquires_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Acquiring a database connection takes more than 50 ms on average"
+          runbook: "The pool is exhausted: check slow gateway calls holding connections (v1 start) and PAYMENTS_DB_MAX_CONNS."
+      - alert: MetricsCollectErrors
+        expr: increase(metrics_collect_errors_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "The database gauges cannot be read"
+          runbook: "The queue gauges are missing while this fires, so queue alerts are blind; check the database."

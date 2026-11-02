@@ -1,7 +1,9 @@
 GO      ?= go
 PKGS    := ./...
 
-.PHONY: run test test-integration e2e lint compose-up compose-down
+PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0
+
+.PHONY: run test test-integration e2e lint check-alerts compose-up compose-down
 
 ## run: build and start the whole stack in the foreground (Ctrl-C stops it)
 run:
@@ -25,6 +27,13 @@ lint:
 	$(GO) vet $(PKGS)
 	$(GO) vet -tags integration $(PKGS)
 	@if command -v staticcheck >/dev/null; then staticcheck -checks all $(PKGS); else echo "staticcheck not installed, skipped"; fi
+
+## check-alerts: validate the Prometheus config and run the alert rule tests
+check-alerts:
+	docker run --rm -v "$(CURDIR)/deploy/prometheus:/etc/prometheus:ro" --entrypoint promtool \
+		$(PROMETHEUS_IMAGE) check config /etc/prometheus/prometheus.yml
+	docker run --rm -v "$(CURDIR)/deploy/prometheus:/etc/prometheus:ro" -w /etc/prometheus --entrypoint promtool \
+		$(PROMETHEUS_IMAGE) test rules alerts_test.yml
 
 ## compose-up: start the stack in the background and wait until healthy
 compose-up:

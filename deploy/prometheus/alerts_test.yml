@@ -1,0 +1,62 @@
+# Unit tests for alerts.yml: promtool test rules alerts_test.yml
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'tasks_dead{kind="start_payment", instance="a:9100", job="payments"}'
+        values: '0 0 1 1 1 1'
+      - series: 'tasks_dead{kind="start_payment", instance="b:9100", job="payments"}'
+        values: '0 0 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DeadTasks
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: DeadTasks
+        exp_alerts:
+          # One alert, not one per instance: the gauge is aggregated with max.
+          - exp_labels:
+              severity: ticket
+              kind: start_payment
+            exp_annotations:
+              summary: "Dead start_payment tasks wait for an operator"
+              runbook: "Read last_error of the dead tasks, fix the cause, then requeue or reconcile with the gateway."
+
+  - interval: 1m
+    input_series:
+      - series: 'gateway_requests_total{op="create", outcome="ok", job="payments"}'
+        values: '0+10x10'
+      - series: 'gateway_requests_total{op="create", outcome="misconfigured", job="payments"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GatewayMisconfigured
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: GatewayMisconfigured
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "The gateway refuses our credentials or URL"
+              runbook: "Check PAYMENTS_GATEWAY_URL and the gateway credentials; affected payments wait in pending."
+
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{route="/v1/payments", method="POST", code="201", job="payments"}'
+        values: '0+100x30'
+      - series: 'http_requests_total{route="/v1/payments", method="POST", code="500", job="payments"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HTTP5xxRatio
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "More than 1% of API requests fail with 5xx"
+              runbook: "Look for 'request failed' errors in the logs, grouped by route; then check the database."

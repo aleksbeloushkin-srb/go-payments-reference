@@ -1,6 +1,10 @@
 package queue
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
+)
 
 // Attempt outcomes recorded in task_attempts_total.
 const (
@@ -47,5 +51,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 	}
 	reg.MustRegister(m.claimed, m.attempts, m.lag, m.leaseLost, m.panics)
+	// Create the series of every known kind at zero, so increase() and
+	// rate() see the first event instead of starting from it.
+	for _, kind := range ports.TaskKinds {
+		m.claimed.WithLabelValues(string(kind))
+		for _, o := range []string{outcomeOK, outcomeRetry, outcomePermanent, outcomeDead} {
+			m.attempts.WithLabelValues(string(kind), o)
+		}
+	}
 	return m
 }

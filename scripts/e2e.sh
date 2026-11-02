@@ -12,6 +12,7 @@ cd "$(dirname "$0")/.."
 
 API=${API:-http://localhost:8080}
 ADMIN=${ADMIN:-http://localhost:9100}
+PROM=${PROM:-http://localhost:9091}
 GW=${GW:-http://localhost:9090}
 KEEP=${KEEP:-0}
 
@@ -75,6 +76,15 @@ gw_control() { curl -sS -X POST "$GW/_control?$1" >/dev/null; }
 gw_stat() { curl -sS "$GW/_control" | jq -r ".stats.\"$1\" // 0"; }
 expect() { [ "$2" = "$3" ] || fail "$1: got '$2', want '$3'"; ok "$1"; }
 
+# metric SERIES -> the value of one exact series from /metrics, e.g.
+# 'http_requests_total{code="201",method="POST",route="/v1/payments"}'
+metric() { curl -sS "$ADMIN/metrics" | awk -v s="$1" '$1 == s { print $2 }'; }
+at_least() {
+  awk -v v="${2:-}" -v w="$3" 'BEGIN { exit !(v != "" && v + 0 >= w) }' || fail "$1: got '${2:-missing}', want >= $3"
+  ok "$1"
+}
+prom_query() { curl -sS "$PROM/api/v1/query" --data-urlencode "query=$1" | jq -r '.data.result[0].value[1] // empty'; }
+
 log "==> starting the stack"
 # Both services run the same image: build it once, then start everything.
 docker compose build payments
@@ -89,6 +99,8 @@ for asset in app.js style.css logo.svg; do
 done
 
 log "==> idempotent create"
+created_before=$(metric payments_created_total)
+[ -n "$created_before" ] || fail "payments_created_total is not exported"
 out=$(create e2e-key-1 1250)
 expect "first create" "${out%% *}" 201
 id=$(jq -r .id <<<"${out#* }")
@@ -98,6 +110,8 @@ expect "replay returns the same payment" "$(jq -r .id <<<"${out#* }")" "$id"
 out=$(create e2e-key-1 9999)
 expect "same key, different body" "${out%% *}" 422
 expect "happy path" "$(follow "$id")" succeeded
+expect "payments_created_total grew by one, replays not counted" "$(metric payments_created_total)" "$((created_before + 1))"
+at_least "transition to succeeded counted" "$(metric 'payment_transitions_total{from="processing",to="succeeded"}')" 1
 
 log "==> gateway answers 429 twice, then accepts"
 gw_control "faults=429,429"
@@ -159,6 +173,43 @@ until [ "$(sql "SELECT count(*) FROM outbox WHERE published_at IS NULL")" = 0 ];
 done
 ok "outbox drained ($(sql "SELECT count(*) FROM outbox") events)"
 expect "no dead tasks" "$(sql "SELECT count(*) FROM tasks WHERE state='dead'")" 0
+
+log "==> metrics on the admin port"
+at_least "POST 201 counted by route" "$(metric 'http_requests_total{code="201",method="POST",route="/v1/payments"}')" 1
+at_least "replay 200 counted" "$(metric 'http_requests_total{code="200",method="POST",route="/v1/payments"}')" 1
+at_least "conflict 422 counted" "$(metric 'http_requests_total{code="422",method="POST",route="/v1/payments"}')" 1
+at_least "long polls in their own histogram" "$(metric http_long_poll_duration_seconds_count)" 1
+at_least "start tasks succeeded" "$(metric 'task_attempts_total{kind="start_payment",outcome="ok"}')" 1
+at_least "start tasks retried" "$(metric 'task_attempts_total{kind="start_payment",outcome="retry"}')" 4
+at_least "gateway creates ok" "$(metric 'gateway_requests_total{op="create",outcome="ok"}')" 1
+at_least "gateway 429 counted" "$(metric 'gateway_requests_total{op="create",outcome="rate_limited"}')" 2
+at_least "gateway 401 counted as misconfigured" "$(metric 'gateway_requests_total{op="create",outcome="misconfigured"}')" 1
+at_least "gateway unknown outcomes counted" "$(metric 'gateway_requests_total{op="create",outcome="ambiguous"}')" 3
+at_least "outbox events published" "$(metric outbox_published_total)" 1
+at_least "time to final observed" "$(metric 'payment_time_to_final_seconds_count{status="succeeded"}')" 1
+expect "no dead tasks in the gauge" "$(metric 'tasks_dead{kind="start_payment"}')" 0
+for series in task_oldest_ready_seconds outbox_oldest_unpublished_seconds longpoll_waiters \
+  db_pool_total_conns db_pool_acquire_wait_seconds_total go_goroutines process_resident_memory_bytes; do
+  [ -n "$(metric "$series")" ] || fail "series $series is missing"
+done
+ok "database, pool, runtime and process series present"
+expect "no ids in labels" "$(curl -sS "$ADMIN/metrics" | grep -cE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-' || true)" 0
+
+log "==> Prometheus scrapes the admin port and evaluates the alert rules"
+deadline=$((SECONDS + 60))
+until [ "$(prom_query 'up{job="payments"}')" = 1 ]; do
+  [ $SECONDS -lt $deadline ] || fail "Prometheus does not scrape the payments admin port"
+  sleep 1
+done
+ok "scrape target is up"
+expect "alert rule groups loaded" "$(curl -sS "$PROM/api/v1/rules" | jq '.data.groups | length')" 4
+deadline=$((SECONDS + 60))
+until curl -sS "$PROM/api/v1/alerts" | jq -e '.data.alerts[] | select(.labels.alertname == "GatewayMisconfigured")' >/dev/null; do
+  [ $SECONDS -lt $deadline ] || fail "GatewayMisconfigured did not fire after the 401 answer"
+  sleep 1
+done
+ok "GatewayMisconfigured fires after the 401 answer"
+expect "DeadTasks does not fire" "$(curl -sS "$PROM/api/v1/alerts" | jq '[.data.alerts[] | select(.labels.alertname == "DeadTasks")] | length')" 0
 
 log "==> graceful stop"
 docker compose stop payments >/dev/null

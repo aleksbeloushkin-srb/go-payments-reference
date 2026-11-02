@@ -314,6 +314,13 @@ func TestGatewayMetricsOutcomes(t *testing.T) {
 	}
 }
 
+func TestGatewayMetricsStartAtZero(t *testing.T) {
+	m := NewMetrics(prometheus.NewRegistry())
+	if n := testutil.CollectAndCount(m.requests); n != 2*len(outcomes) {
+		t.Fatalf("request series at start = %d, want every op and outcome at zero", n)
+	}
+}
+
 func TestGatewayMetricsCountInlineRetries(t *testing.T) {
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -84,8 +84,19 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"op"}),
 	}
 	reg.MustRegister(m.requests, m.duration)
+	// Create every series at zero. increase() and rate() ignore the first
+	// sample of a new series, so a counter that first appears at 1 would
+	// never trigger the alert that watches it.
+	for _, op := range []string{opCreate, opRead} {
+		for _, o := range outcomes {
+			m.requests.WithLabelValues(op, o)
+		}
+	}
 	return m
 }
+
+// outcomes lists every value of the outcome label.
+var outcomes = []string{"ok", "declined", "rate_limited", "ambiguous", "misconfigured", "error"}
 
 // outcome names the class of a result for the metrics.
 func outcome(err error) string {
