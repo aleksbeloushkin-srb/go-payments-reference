@@ -5,5 +5,6 @@
 // with exponential backoff and jitter, postponed without counting an attempt
 // (polling), or moved to the dead state after too many attempts or a
 // permanent error. Dead tasks are the dead-letter queue: they are logged at
-// error level and counted in the "queue" expvar map.
+// error level, counted in task_attempts_total and visible as the tasks_dead
+// gauge.
 package queue

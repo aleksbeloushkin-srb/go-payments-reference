@@ -17,9 +17,9 @@
 //
 // Only an explicit decline (400, 402, 422) fails a payment. 401, 403, 404,
 // 405 and unknown 4xx answers mean our credentials or URL are wrong: they
-// are reported as ports.ErrGatewayMisconfigured, counted in the "gateway"
-// expvar map and retried, because a configuration mistake must not turn into
-// failed payments.
+// are reported as ports.ErrGatewayMisconfigured, counted in
+// gateway_requests_total with outcome "misconfigured" and retried, because a
+// configuration mistake must not turn into failed payments.
 //
 // One more retry layer hides in net/http: for a request that carries an
 // Idempotency-Key header and a re-readable body, http.Transport may resend
@@ -33,7 +33,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"expvar"
 	"fmt"
 	"io"
 	"net"
@@ -41,6 +40,8 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/domain/payment"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
@@ -56,9 +57,54 @@ const (
 	maxResponseBytes = 1 << 20
 )
 
-// stats counts gateway answers that need attention. "misconfigured" is the
-// one to alert on.
-var stats = expvar.NewMap("gateway")
+// Operations, the op label of the gateway metrics.
+const (
+	opCreate = "create"
+	opRead   = "read"
+)
+
+// Metrics are the gateway client's Prometheus metrics: one observation per
+// HTTP exchange, so in-line retries are visible.
+type Metrics struct {
+	requests *prometheus.CounterVec
+	duration *prometheus.HistogramVec
+}
+
+// NewMetrics creates the gateway metrics and registers them on reg.
+func NewMetrics(reg prometheus.Registerer) *Metrics {
+	m := &Metrics{
+		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_requests_total",
+			Help: "Gateway HTTP exchanges by operation and classified outcome: ok, declined, rate_limited, ambiguous, misconfigured, error.",
+		}, []string{"op", "outcome"}),
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gateway_request_duration_seconds",
+			Help:    "Duration of one gateway HTTP exchange.",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8},
+		}, []string{"op"}),
+	}
+	reg.MustRegister(m.requests, m.duration)
+	return m
+}
+
+// outcome names the class of a result for the metrics.
+func outcome(err error) string {
+	var hint *ports.RetryAfterError
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ports.ErrGatewayRejected):
+		return "declined"
+	case errors.As(err, &hint):
+		return "rate_limited"
+	case errors.Is(err, ports.ErrGatewayMisconfigured):
+		return "misconfigured"
+	case errors.Is(err, ports.ErrGatewayAmbiguous):
+		return "ambiguous"
+	default:
+		return "error"
+	}
+}
 
 // result is the classified outcome of one HTTP exchange.
 type result struct {
@@ -88,20 +134,21 @@ type Config struct {
 
 // Client talks to the gateway's REST API.
 type Client struct {
-	base *url.URL
-	http *http.Client
-	cfg  Config
+	base    *url.URL
+	http    *http.Client
+	metrics *Metrics
+	cfg     Config
 	// wait pauses between attempts. Tests replace it to avoid real sleeps.
 	wait func(ctx context.Context, d time.Duration) error
 }
 
 // NewClient returns a Client for cfg.BaseURL using hc.
-func NewClient(cfg Config, hc *http.Client) (*Client, error) {
+func NewClient(cfg Config, hc *http.Client, m *Metrics) (*Client, error) {
 	base, err := url.Parse(cfg.BaseURL)
 	if err != nil || base.Scheme == "" || base.Host == "" {
 		return nil, fmt.Errorf("gateway: invalid base URL %q", cfg.BaseURL)
 	}
-	return &Client{base: base, http: hc, cfg: cfg, wait: sleepCtx}, nil
+	return &Client{base: base, http: hc, metrics: m, cfg: cfg, wait: sleepCtx}, nil
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -138,17 +185,20 @@ func (c *Client) CreatePayment(ctx context.Context, req ports.GatewayRequest) (p
 	if err != nil {
 		return ports.GatewayPayment{}, fmt.Errorf("gateway: encode request: %w", err)
 	}
-	return c.call(ctx, http.MethodPost, "/v1/payments", body, req.IdempotencyKey)
+	return c.call(ctx, opCreate, http.MethodPost, "/v1/payments", body, req.IdempotencyKey)
 }
 
 // Payment reads a payment by the gateway's reference.
 func (c *Client) Payment(ctx context.Context, ref string) (ports.GatewayPayment, error) {
-	return c.call(ctx, http.MethodGet, "/v1/payments/"+url.PathEscape(ref), nil, "")
+	return c.call(ctx, opRead, http.MethodGet, "/v1/payments/"+url.PathEscape(ref), nil, "")
 }
 
-func (c *Client) call(ctx context.Context, method, path string, body []byte, idempotencyKey string) (ports.GatewayPayment, error) {
+func (c *Client) call(ctx context.Context, op, method, path string, body []byte, idempotencyKey string) (ports.GatewayPayment, error) {
 	for attempt := 0; ; attempt++ {
+		start := time.Now()
 		r := c.once(ctx, method, path, body, idempotencyKey)
+		c.metrics.duration.WithLabelValues(op).Observe(time.Since(start).Seconds())
+		c.metrics.requests.WithLabelValues(op, outcome(r.err)).Inc()
 		if r.err == nil {
 			return r.payment, nil
 		}
@@ -211,7 +261,6 @@ func (c *Client) classify(resp *http.Response, write bool, path string) result {
 		}
 		return result{payment: res}
 	case code == http.StatusTooManyRequests:
-		stats.Add("rate_limited", 1)
 		wait := retryAfter(resp.Header.Get("Retry-After"), time.Now())
 		err := &ports.RetryAfterError{
 			After: wait,
@@ -224,18 +273,14 @@ func (c *Client) classify(resp *http.Response, write bool, path string) result {
 	case code == http.StatusRequestTimeout:
 		return failed(fmt.Errorf("%w: status %d", ports.ErrGatewayUnavailable, code))
 	case write && (code == http.StatusBadRequest || code == http.StatusPaymentRequired || code == http.StatusUnprocessableEntity):
-		stats.Add("declined", 1)
 		return failed(fmt.Errorf("%w: status %d: %s", ports.ErrGatewayRejected, code, snippet(resp.Body)))
 	case write && (code == http.StatusConflict || code == http.StatusTooEarly):
 		// A request with this idempotency key is still being processed.
-		stats.Add("ambiguous", 1)
 		return failed(fmt.Errorf("%w: status %d, request with this key still in progress", ports.ErrGatewayAmbiguous, code))
 	case code >= 400 && code < 500:
-		stats.Add("misconfigured", 1)
 		return failed(fmt.Errorf("%w: %w: status %d: %s",
 			ports.ErrGatewayUnavailable, ports.ErrGatewayMisconfigured, code, snippet(resp.Body)))
 	case write:
-		stats.Add("ambiguous", 1)
 		return failed(fmt.Errorf("%w: status %d", ports.ErrGatewayAmbiguous, code))
 	default:
 		return failed(fmt.Errorf("%w: status %d", ports.ErrGatewayUnavailable, code))
@@ -250,7 +295,6 @@ func transportFailure(err error, write bool) result {
 		return result{err: fmt.Errorf("%w: %w", ports.ErrGatewayUnavailable, err), retry: true, wait: dialRetryDelay}
 	}
 	if write {
-		stats.Add("ambiguous", 1)
 		return failed(fmt.Errorf("%w: %w", ports.ErrGatewayAmbiguous, err))
 	}
 	return failed(fmt.Errorf("%w: %w", ports.ErrGatewayUnavailable, err))

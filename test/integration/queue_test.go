@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/queue"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
@@ -65,7 +66,7 @@ func TestConcurrentWorkersNeverDoubleProcess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w := queue.NewWorker(e.tasks, h, e.clock, nil, discard(), workerConfig())
+			w := queue.NewWorker(e.tasks, h, e.clock, nil, queue.NewMetrics(prometheus.NewRegistry()), discard(), workerConfig())
 			for {
 				n, err := w.RunOnce(context.Background())
 				if err != nil {
@@ -130,7 +131,7 @@ func TestTaskGoesDeadAfterMaxAttempts(t *testing.T) {
 	w := queue.NewWorker(e.tasks, handlerFunc(func(context.Context, ports.Task) error {
 		runs.Add(1)
 		return errors.New("gateway down")
-	}), e.clock, nil, discard(), workerConfig())
+	}), e.clock, nil, queue.NewMetrics(prometheus.NewRegistry()), discard(), workerConfig())
 
 	for range workerConfig().MaxAttempts {
 		if n, err := w.RunOnce(context.Background()); err != nil || n != 1 {
@@ -162,7 +163,7 @@ func TestRetryLaterKeepsAttempts(t *testing.T) {
 	enqueue(t, e, 1)
 	w := queue.NewWorker(e.tasks, handlerFunc(func(context.Context, ports.Task) error {
 		return ports.RetryLater(5*time.Second, "processing")
-	}), e.clock, nil, discard(), workerConfig())
+	}), e.clock, nil, queue.NewMetrics(prometheus.NewRegistry()), discard(), workerConfig())
 
 	for range 5 {
 		if n, err := w.RunOnce(context.Background()); err != nil || n != 1 {

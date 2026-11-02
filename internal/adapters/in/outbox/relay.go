@@ -10,15 +10,36 @@ package outbox
 
 import (
 	"context"
-	"expvar"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
 
-var stats = expvar.NewMap("outbox")
+// Metrics are the relay's Prometheus metrics.
+type Metrics struct {
+	published prometheus.Counter
+	failed    prometheus.Counter
+}
+
+// NewMetrics creates the relay metrics and registers them on reg.
+func NewMetrics(reg prometheus.Registerer) *Metrics {
+	m := &Metrics{
+		published: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "outbox_published_total",
+			Help: "Outbox events published and marked.",
+		}),
+		failed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "outbox_failed_total",
+			Help: "Failed deliveries; the event is released and published again later.",
+		}),
+	}
+	reg.MustRegister(m.published, m.failed)
+	return m
+}
 
 // settleTimeout bounds the statements that record a batch's outcome.
 const settleTimeout = 5 * time.Second
@@ -65,18 +86,19 @@ type Config struct {
 
 // Relay moves events from the outbox to a Publisher.
 type Relay struct {
-	store Store
-	pub   Publisher
-	clock ports.Clock
-	wake  <-chan struct{}
-	cfg   Config
-	log   *slog.Logger
+	store   Store
+	pub     Publisher
+	clock   ports.Clock
+	wake    <-chan struct{}
+	metrics *Metrics
+	cfg     Config
+	log     *slog.Logger
 }
 
 // NewRelay returns a Relay. wake may be nil; a value on it starts a batch
 // without waiting for the next tick.
-func NewRelay(store Store, pub Publisher, clock ports.Clock, wake <-chan struct{}, cfg Config, log *slog.Logger) *Relay {
-	return &Relay{store: store, pub: pub, clock: clock, wake: wake, cfg: cfg, log: log}
+func NewRelay(store Store, pub Publisher, clock ports.Clock, wake <-chan struct{}, m *Metrics, cfg Config, log *slog.Logger) *Relay {
+	return &Relay{store: store, pub: pub, clock: clock, wake: wake, metrics: m, cfg: cfg, log: log}
 }
 
 // Run publishes until ctx is cancelled.
@@ -150,9 +172,9 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 		}
 	}
 
-	stats.Add("published", int64(len(published)))
+	r.metrics.published.Add(float64(len(published)))
 	if pubErr != nil {
-		stats.Add("failed", 1)
+		r.metrics.failed.Inc()
 	}
 	return len(published), pubErr
 }

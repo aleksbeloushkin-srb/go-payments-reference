@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
@@ -86,11 +89,23 @@ var (
 )
 
 func newWorker(store *fakeStore, h Handler) *Worker {
-	return NewWorker(store, h, fixedClock{t0}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), testCfg)
+	return NewWorker(store, h, fixedClock{t0}, nil, NewMetrics(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), testCfg)
 }
 
 func task(id int64, attempts int) ports.Task {
 	return ports.Task{ID: id, Kind: ports.TaskStartPayment, PaymentID: uuid.New(), Attempts: attempts}
+}
+
+// wantOutcome is the task_attempts_total outcome of each case below.
+var wantOutcome = map[string]string{
+	"success":                                   outcomeOK,
+	"first failure backs off":                   outcomeRetry,
+	"second failure backs off longer":           outcomeRetry,
+	"last attempt goes dead":                    outcomeDead,
+	"permanent goes dead at once":               outcomePermanent,
+	"retry later postpones":                     outcomeOK,
+	"retry-after hint longer than backoff wins": outcomeRetry,
+	"backoff longer than hint wins":             outcomeRetry,
 }
 
 func TestWorkerSettlesEachOutcome(t *testing.T) {
@@ -129,6 +144,16 @@ func TestWorkerSettlesEachOutcome(t *testing.T) {
 			if len(store.settled) != 1 || store.settled[0] != tt.want {
 				t.Fatalf("settled = %+v, want %+v", store.settled, tt.want)
 			}
+			outcome := wantOutcome[tt.name]
+			if got := testutil.ToFloat64(w.metrics.attempts.WithLabelValues("start_payment", outcome)); got != 1 {
+				t.Fatalf("task_attempts_total{outcome=%q} = %v, want 1", outcome, got)
+			}
+			if n := testutil.CollectAndCount(w.metrics.attempts); n != 1 {
+				t.Fatalf("attempt series = %d, want exactly one outcome recorded", n)
+			}
+			if got := testutil.ToFloat64(w.metrics.claimed.WithLabelValues("start_payment")); got != 1 {
+				t.Fatalf("tasks_claimed_total = %v, want 1", got)
+			}
 		})
 	}
 }
@@ -143,6 +168,9 @@ func TestWorkerRecoversHandlerPanic(t *testing.T) {
 	if got := store.settled[0]; got.how != "retried" || got.cause != "handler panic: nil map" {
 		t.Fatalf("settled = %+v, want a retry", got)
 	}
+	if got := testutil.ToFloat64(w.metrics.panics); got != 1 {
+		t.Fatalf("task_panics_total = %v, want 1", got)
+	}
 }
 
 func TestWorkerSurvivesLostLease(t *testing.T) {
@@ -151,6 +179,32 @@ func TestWorkerSurvivesLostLease(t *testing.T) {
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("a lost lease is not a worker error: %v", err)
+	}
+	if got := testutil.ToFloat64(w.metrics.leaseLost); got != 1 {
+		t.Fatalf("lease_lost_total = %v, want 1", got)
+	}
+	if n := testutil.CollectAndCount(w.metrics.attempts); n != 0 {
+		t.Fatal("a discarded result must not be counted as an attempt")
+	}
+}
+
+// task_lag_seconds measures how long a due task waited for its claim.
+func TestWorkerObservesTaskLag(t *testing.T) {
+	late := task(1, 0)
+	late.RunAfter = t0.Add(-5 * time.Second)
+	store := &fakeStore{queue: []ports.Task{late}}
+	w := newWorker(store, handlerFunc(func(context.Context, ports.Task) error { return nil }))
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var m dto.Metric
+	if err := w.metrics.lag.WithLabelValues("start_payment").(prometheus.Metric).Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	if h := m.GetHistogram(); h.GetSampleCount() != 1 || h.GetSampleSum() != 5 {
+		t.Fatalf("lag histogram count=%d sum=%v, want one sample of 5s", h.GetSampleCount(), h.GetSampleSum())
 	}
 }
 
@@ -218,7 +272,7 @@ func TestWorkerWakesOnSignal(t *testing.T) {
 	w := NewWorker(store, handlerFunc(func(context.Context, ports.Task) error {
 		close(ran)
 		return nil
-	}), fixedClock{t0}, wake, slog.New(slog.NewTextHandler(io.Discard, nil)), testCfg)
+	}), fixedClock{t0}, wake, NewMetrics(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), testCfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -275,7 +329,7 @@ func TestWorkerStopClaiming(t *testing.T) {
 	store := &fakeStore{queue: []ports.Task{task(1, 0)}}
 	wake := make(chan struct{}, 1)
 	w := NewWorker(store, handlerFunc(func(context.Context, ports.Task) error { return nil }),
-		fixedClock{t0}, wake, slog.New(slog.NewTextHandler(io.Discard, nil)), testCfg)
+		fixedClock{t0}, wake, NewMetrics(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), testCfg)
 	w.StopClaiming()
 	w.StopClaiming() // idempotent
 

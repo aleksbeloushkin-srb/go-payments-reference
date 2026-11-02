@@ -108,11 +108,12 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 	payments := postgres.NewPayments(tx)
 	tasks := postgres.NewTasks(tx)
 	events := postgres.NewOutbox(tx)
-	gw, err := newGateway(cfg)
+	gw, err := newGateway(cfg, gateway.NewMetrics(reg))
 	if err != nil {
 		return err
 	}
-	waiters := longpoll.NewRegistry(cfg.WaitMaxWaiters)
+	longpollMetrics := longpoll.NewMetrics(reg)
+	waiters := longpoll.NewRegistry(cfg.WaitMaxWaiters, longpollMetrics)
 
 	// Use cases.
 	svc := app.NewService(app.Deps{
@@ -137,7 +138,7 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 	// context: they must keep running while HTTP drains.
 	bg := platform.NewGroup(log)
 	if cfg.Roles.API {
-		batcher := longpoll.NewBatcher(waiters, payments, longpoll.BatcherConfig{
+		batcher := longpoll.NewBatcher(waiters, payments, longpollMetrics, longpoll.BatcherConfig{
 			Interval:     cfg.WaitBatchInterval,
 			QueryTimeout: cfg.WaitReadTimeout,
 		}, log)
@@ -145,7 +146,7 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 	}
 	stopClaiming := func() {}
 	if cfg.Roles.Worker {
-		w := queue.NewWorker(tasks, svc, clock, tasks.Ready(), log, queue.Config{
+		w := queue.NewWorker(tasks, svc, clock, tasks.Ready(), queue.NewMetrics(reg), log, queue.Config{
 			Concurrency:  cfg.WorkerConcurrency,
 			IdleInterval: cfg.WorkerIdleInterval,
 			Lease:        cfg.TaskLease,
@@ -157,7 +158,7 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 		stopClaiming = w.StopClaiming
 	}
 	if cfg.Roles.Relay {
-		relay := outbox.NewRelay(events, newPublisher(cfg, log), clock, events.Ready(), outbox.Config{
+		relay := outbox.NewRelay(events, newPublisher(cfg, log), clock, events.Ready(), outbox.NewMetrics(reg), outbox.Config{
 			Interval:       cfg.RelayInterval,
 			Batch:          cfg.RelayBatch,
 			Lease:          cfg.RelayLease,
@@ -179,6 +180,7 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 			WebhookSecret: []byte(cfg.WebhookSecret),
 			Static:        web.FS,
 			Clock:         clock,
+			Metrics:       httpapi.NewMetrics(reg),
 			Logger:        log,
 		})
 		srv = httpapi.NewServer(httpapi.ServerConfig{
@@ -251,7 +253,7 @@ func shutdown(ctx context.Context, cfg platform.Config, log *slog.Logger, ready 
 
 // newGateway builds the gateway client. Only the worker role calls the
 // gateway, so a process without it may run without a gateway URL.
-func newGateway(cfg platform.Config) (ports.Gateway, error) {
+func newGateway(cfg platform.Config, m *gateway.Metrics) (ports.Gateway, error) {
 	if !cfg.Roles.Worker && cfg.GatewayURL == "" {
 		return noGateway{}, nil
 	}
@@ -260,7 +262,7 @@ func newGateway(cfg platform.Config) (ports.Gateway, error) {
 		CallTimeout:   cfg.GatewayTimeout,
 		MaxRetries:    cfg.GatewayMaxRetries,
 		MaxRetryAfter: cfg.GatewayMaxRetryAfter,
-	}, platform.NewHTTPClient())
+	}, platform.NewHTTPClient(), m)
 	if err != nil {
 		// Return a nil interface, not an interface holding a nil *Client.
 		return nil, err

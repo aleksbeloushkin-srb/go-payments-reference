@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
@@ -41,6 +44,8 @@ func (f *fakeVersions) Versions(_ context.Context, ids []uuid.UUID) (map[uuid.UU
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+func newMetrics() *Metrics { return NewMetrics(prometheus.NewRegistry()) }
+
 // received reports whether ch already holds a value, without blocking.
 func received(ch <-chan int64) (int64, bool) {
 	select {
@@ -52,10 +57,10 @@ func received(ch <-chan int64) (int64, bool) {
 }
 
 func TestPollWakesOnlyWaitersBehindTheVersion(t *testing.T) {
-	reg := NewRegistry(10)
+	reg := NewRegistry(10, newMetrics())
 	id := uuid.New()
 	src := &fakeVersions{versions: map[uuid.UUID]int64{id: 3}}
-	b := NewBatcher(reg, src, BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
+	b := NewBatcher(reg, src, newMetrics(), BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
 
 	behind, cancelBehind, _ := reg.Watch(id, 2)
 	defer cancelBehind()
@@ -78,8 +83,8 @@ func TestPollWakesOnlyWaitersBehindTheVersion(t *testing.T) {
 }
 
 func TestPollKeepsWaitersOfMissingIDs(t *testing.T) {
-	reg := NewRegistry(10)
-	b := NewBatcher(reg, &fakeVersions{}, BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
+	reg := NewRegistry(10, newMetrics())
+	b := NewBatcher(reg, &fakeVersions{}, newMetrics(), BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
 	ch, cancel, _ := reg.Watch(uuid.New(), 1)
 	defer cancel()
 
@@ -92,8 +97,8 @@ func TestPollKeepsWaitersOfMissingIDs(t *testing.T) {
 }
 
 func TestPollErrorKeepsWaiters(t *testing.T) {
-	reg := NewRegistry(10)
-	b := NewBatcher(reg, &fakeVersions{err: errors.New("db down")}, BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
+	reg := NewRegistry(10, newMetrics())
+	b := NewBatcher(reg, &fakeVersions{err: errors.New("db down")}, newMetrics(), BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
 	_, cancel, _ := reg.Watch(uuid.New(), 1)
 	defer cancel()
 
@@ -107,7 +112,7 @@ func TestPollErrorKeepsWaiters(t *testing.T) {
 
 func TestPollWithoutWaitersDoesNotQuery(t *testing.T) {
 	src := &fakeVersions{calls: make(chan []uuid.UUID, 1)}
-	b := NewBatcher(NewRegistry(10), src, BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
+	b := NewBatcher(NewRegistry(10, newMetrics()), src, newMetrics(), BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
 
 	if err := b.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -117,8 +122,51 @@ func TestPollWithoutWaitersDoesNotQuery(t *testing.T) {
 	}
 }
 
+func TestRegistryMetrics(t *testing.T) {
+	m := newMetrics()
+	reg := NewRegistry(2, m)
+	id := uuid.New()
+	_, cancelA, _ := reg.Watch(id, 0)
+	_, cancelB, _ := reg.Watch(id, 5)
+	if _, _, err := reg.Watch(id, 0); !errors.Is(err, ports.ErrTooManyWaiters) {
+		t.Fatalf("err = %v", err)
+	}
+	if w, r := testutil.ToFloat64(m.waiters), testutil.ToFloat64(m.rejected); w != 2 || r != 1 {
+		t.Fatalf("longpoll_waiters = %v, longpoll_rejected_total = %v; want 2 and 1", w, r)
+	}
+
+	reg.Notify(id, 3) // wakes and removes the first waiter only
+	if w := testutil.ToFloat64(m.waiters); w != 1 {
+		t.Fatalf("waiters after notify = %v, want 1", w)
+	}
+	cancelA()
+	cancelB()
+	if w := testutil.ToFloat64(m.waiters); w != 0 {
+		t.Fatalf("waiters after cancel = %v, want 0", w)
+	}
+}
+
+func TestBatcherObservesQueryDuration(t *testing.T) {
+	m := newMetrics()
+	reg := NewRegistry(10, m)
+	_, cancel, _ := reg.Watch(uuid.New(), 0)
+	defer cancel()
+	b := NewBatcher(reg, &fakeVersions{}, m, BatcherConfig{Interval: time.Hour, QueryTimeout: time.Second}, discard())
+
+	if err := b.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var got dto.Metric
+	if err := m.batchQuery.Write(&got); err != nil {
+		t.Fatal(err)
+	}
+	if n := got.GetHistogram().GetSampleCount(); n != 1 {
+		t.Fatalf("batch query observations = %d, want 1", n)
+	}
+}
+
 func TestWatchRespectsLimit(t *testing.T) {
-	reg := NewRegistry(1)
+	reg := NewRegistry(1, newMetrics())
 	_, cancel, err := reg.Watch(uuid.New(), 0)
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +182,7 @@ func TestWatchRespectsLimit(t *testing.T) {
 }
 
 func TestCancelIsIdempotent(t *testing.T) {
-	reg := NewRegistry(10)
+	reg := NewRegistry(10, newMetrics())
 	id := uuid.New()
 	_, cancel, _ := reg.Watch(id, 0)
 	reg.Notify(id, 1)
@@ -148,7 +196,7 @@ func TestCancelIsIdempotent(t *testing.T) {
 }
 
 func TestCloseReleasesWaitersAndRejectsNewOnes(t *testing.T) {
-	reg := NewRegistry(10)
+	reg := NewRegistry(10, newMetrics())
 	ch, cancel, _ := reg.Watch(uuid.New(), 0)
 	defer cancel()
 
@@ -164,11 +212,11 @@ func TestCloseReleasesWaitersAndRejectsNewOnes(t *testing.T) {
 }
 
 func TestRunPollsUntilCancelled(t *testing.T) {
-	reg := NewRegistry(10)
+	reg := NewRegistry(10, newMetrics())
 	_, cancelWatch, _ := reg.Watch(uuid.New(), 0)
 	defer cancelWatch()
 	src := &fakeVersions{calls: make(chan []uuid.UUID)}
-	b := NewBatcher(reg, src, BatcherConfig{Interval: time.Millisecond, QueryTimeout: time.Second}, discard())
+	b := NewBatcher(reg, src, newMetrics(), BatcherConfig{Interval: time.Millisecond, QueryTimeout: time.Second}, discard())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
@@ -191,7 +239,7 @@ func TestRunPollsUntilCancelled(t *testing.T) {
 }
 
 func TestConcurrentWatchNotifyCancel(t *testing.T) {
-	reg := NewRegistry(500)
+	reg := NewRegistry(500, newMetrics())
 	id := uuid.New()
 	var wg sync.WaitGroup
 	for i := range 50 {

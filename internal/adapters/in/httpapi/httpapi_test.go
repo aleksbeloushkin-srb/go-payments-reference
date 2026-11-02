@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/domain/payment"
@@ -78,6 +81,7 @@ func newTestHandler(svc *fakeService, logs io.Writer) http.Handler {
 		WebhookSecret: secret,
 		Static:        staticFS,
 		Clock:         fixedClock{},
+		Metrics:       NewMetrics(prometheus.NewRegistry()),
 		Logger:        platform.NewLogger(logs, slog.LevelDebug),
 	})
 }
@@ -316,8 +320,8 @@ func TestStaticAndHealth(t *testing.T) {
 	if rec := do(h, httptest.NewRequest(http.MethodGet, "/readyz", nil)); rec.Code != http.StatusOK {
 		t.Fatalf("readyz = %d", rec.Code)
 	}
-	if rec := do(h, httptest.NewRequest(http.MethodGet, "/debug/vars", nil)); rec.Code != http.StatusOK {
-		t.Fatalf("debug/vars = %d", rec.Code)
+	if rec := do(h, httptest.NewRequest(http.MethodGet, "/debug/vars", nil)); rec.Code != http.StatusNotFound {
+		t.Fatalf("debug/vars = %d, want 404: metrics live on the admin listener", rec.Code)
 	}
 }
 
@@ -325,7 +329,7 @@ func TestReadyzReportsNotReady(t *testing.T) {
 	h := NewHandler(Deps{
 		Creator: &fakeService{}, Reader: &fakeService{}, Events: &fakeService{},
 		Ready: func() bool { return false }, WebhookSecret: secret, Static: staticFS,
-		Clock: fixedClock{}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Clock: fixedClock{}, Metrics: NewMetrics(prometheus.NewRegistry()), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if rec := do(h, httptest.NewRequest(http.MethodGet, "/readyz", nil)); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("readyz = %d, want 503", rec.Code)
@@ -363,4 +367,78 @@ func TestClientGoneIsLoggedAs499(t *testing.T) {
 	if access["status"] != float64(statusClientClosedRequest) {
 		t.Fatalf("access log = %v, want status 499", access)
 	}
+}
+
+// Request metrics use the route pattern, never the raw path, and keep long
+// polls out of the latency histogram.
+func TestRequestMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewMetrics(reg)
+	svc := &fakeService{waitRes: app.WaitResult{Payment: sample}}
+	h := NewHandler(Deps{
+		Creator: svc, Reader: svc, Events: svc, Ready: func() bool { return true },
+		WebhookSecret: secret, Static: staticFS, Clock: fixedClock{}, Metrics: m,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	do(h, httptest.NewRequest(http.MethodGet, "/v1/payments/"+sample.ID.String(), nil))
+	do(h, httptest.NewRequest(http.MethodGet, "/v1/payments/"+uuid.NewString(), nil))
+	do(h, httptest.NewRequest(http.MethodGet, "/v1/payments/"+sample.ID.String()+"/wait?version=1", nil))
+	do(h, httptest.NewRequest("BREW", "/v1/payments", nil))
+
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("/v1/payments/{id}", "GET", "200")); got != 2 {
+		t.Fatalf("requests for the payment route = %v, want 2 under one series", got)
+	}
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("/v1/payments/{id}/wait", "GET", "200")); got != 1 {
+		t.Fatalf("long polls counted = %v, want 1", got)
+	}
+	// The path exists for POST only, so ServeMux answers 405 without a pattern.
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("unmatched", "OTHER", "405")); got != 1 {
+		t.Fatalf("unknown method = %v, want it folded into OTHER / unmatched", got)
+	}
+	// The latency histogram has the payment route only; the long poll went
+	// to its own histogram.
+	if n := testutil.CollectAndCount(m.duration); n != 2 {
+		t.Fatalf("latency series = %d, want 2 (payment route and unmatched)", n)
+	}
+	for _, mf := range mustGather(t, reg) {
+		if mf.GetName() != "http_request_duration_seconds" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, l := range metric.GetLabel() {
+				if l.GetName() == "route" && strings.HasSuffix(l.GetValue(), "/wait") {
+					t.Fatal("a long poll leaked into http_request_duration_seconds")
+				}
+			}
+		}
+	}
+	var lp dto.Metric
+	if err := m.longPoll.Write(&lp); err != nil || lp.GetHistogram().GetSampleCount() != 1 {
+		t.Fatalf("long-poll histogram samples = %d (%v), want 1", lp.GetHistogram().GetSampleCount(), err)
+	}
+}
+
+// A recovered panic is counted as a 500.
+func TestRequestMetricsCountRecoveredPanics(t *testing.T) {
+	m := NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /boom", func(http.ResponseWriter, *http.Request) { panic("bug") })
+	h := chain(mux, requestID, logging(log), instrument(m), recoverer(log))
+
+	do(h, httptest.NewRequest(http.MethodGet, "/boom", nil))
+
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("/boom", "GET", "500")); got != 1 {
+		t.Fatalf("panicking request counted as %v 500s, want 1", got)
+	}
+}
+
+func mustGather(t *testing.T, g prometheus.Gatherer) []*dto.MetricFamily {
+	t.Helper()
+	mfs, err := g.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mfs
 }

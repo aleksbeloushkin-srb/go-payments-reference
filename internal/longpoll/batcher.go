@@ -26,13 +26,14 @@ type BatcherConfig struct {
 type Batcher struct {
 	registry *Registry
 	versions VersionReader
+	metrics  *Metrics
 	cfg      BatcherConfig
 	log      *slog.Logger
 }
 
 // NewBatcher returns a Batcher.
-func NewBatcher(registry *Registry, versions VersionReader, cfg BatcherConfig, log *slog.Logger) *Batcher {
-	return &Batcher{registry: registry, versions: versions, cfg: cfg, log: log}
+func NewBatcher(registry *Registry, versions VersionReader, m *Metrics, cfg BatcherConfig, log *slog.Logger) *Batcher {
+	return &Batcher{registry: registry, versions: versions, metrics: m, cfg: cfg, log: log}
 }
 
 // Run ticks until ctx is cancelled. A failed query is logged and retried on
@@ -61,7 +62,9 @@ func (b *Batcher) Poll(ctx context.Context) error {
 	}
 	qctx, cancel := context.WithTimeout(ctx, b.cfg.QueryTimeout)
 	defer cancel()
+	start := time.Now()
 	versions, err := b.versions.Versions(qctx, ids)
+	b.metrics.batchQuery.Observe(time.Since(start).Seconds())
 	if err != nil {
 		return err
 	}

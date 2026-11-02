@@ -3,7 +3,6 @@ package queue
 import (
 	"context"
 	"errors"
-	"expvar"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -12,10 +11,6 @@ import (
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
-
-// stats is exported at /debug/vars. "dead" is the dead-letter counter to
-// alert on.
-var stats = expvar.NewMap("queue")
 
 // settleTimeout bounds the statement that records a task's outcome.
 const settleTimeout = 5 * time.Second
@@ -67,6 +62,7 @@ type Worker struct {
 	handler   Handler
 	clock     ports.Clock
 	wake      <-chan struct{}
+	metrics   *Metrics
 	log       *slog.Logger
 	cfg       Config
 	stopClaim chan struct{}
@@ -75,12 +71,13 @@ type Worker struct {
 
 // NewWorker returns a Worker. wake may be nil; when set, a value on it
 // starts a claim immediately instead of at the next idle tick.
-func NewWorker(store Store, handler Handler, clock ports.Clock, wake <-chan struct{}, log *slog.Logger, cfg Config) *Worker {
+func NewWorker(store Store, handler Handler, clock ports.Clock, wake <-chan struct{}, m *Metrics, log *slog.Logger, cfg Config) *Worker {
 	return &Worker{
 		store:     store,
 		handler:   handler,
 		clock:     clock,
 		wake:      wake,
+		metrics:   m,
 		log:       log,
 		cfg:       cfg,
 		stopClaim: make(chan struct{}),
@@ -130,13 +127,16 @@ func (w *Worker) Run(ctx context.Context) error {
 // RunOnce claims one batch, runs it and waits until every task is settled.
 // It returns the number of tasks claimed.
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
-	tasks, err := w.store.Claim(ctx, w.clock.Now(), w.cfg.Concurrency, w.cfg.Lease)
+	now := w.clock.Now()
+	tasks, err := w.store.Claim(ctx, now, w.cfg.Concurrency, w.cfg.Lease)
 	if err != nil {
 		return 0, err
 	}
-	stats.Add("claimed", int64(len(tasks)))
 	var wg sync.WaitGroup
 	for _, t := range tasks {
+		kind := string(t.Kind)
+		w.metrics.claimed.WithLabelValues(kind).Inc()
+		w.metrics.lag.WithLabelValues(kind).Observe(max(now.Sub(t.RunAfter), 0).Seconds())
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -163,7 +163,7 @@ func (w *Worker) process(ctx context.Context, t ports.Task) {
 func (w *Worker) handle(ctx context.Context, t ports.Task) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			stats.Add("panics", 1)
+			w.metrics.panics.Inc()
 			w.log.ErrorContext(ctx, "task handler panicked",
 				"task_id", t.ID, "kind", t.Kind, "panic", p, "stack", string(debug.Stack()))
 			err = fmt.Errorf("handler panic: %v", p)
@@ -179,18 +179,23 @@ func (w *Worker) settle(ctx context.Context, t ports.Task, handleErr error) {
 	attrs := []any{"task_id", t.ID, "kind", t.Kind, "payment_id", t.PaymentID, "attempt", t.Attempts + 1}
 
 	var (
-		later  *ports.RetryLaterError
-		perm   *ports.PermanentError
-		err    error
-		result string
+		later   *ports.RetryLaterError
+		perm    *ports.PermanentError
+		err     error
+		outcome string
 	)
 	switch {
 	case handleErr == nil:
-		err, result = w.store.Complete(sctx, t), "done"
+		err, outcome = w.store.Complete(sctx, t), outcomeOK
 	case errors.As(handleErr, &later):
-		err, result = w.store.Postpone(sctx, t, now.Add(later.After)), "postponed"
+		// The run worked; the task simply runs again later (polling).
+		err, outcome = w.store.Postpone(sctx, t, now.Add(later.After)), outcomeOK
 	case errors.As(handleErr, &perm), t.Attempts+1 >= w.cfg.MaxAttempts:
-		err, result = w.store.Bury(sctx, t, handleErr.Error()), "dead"
+		outcome = outcomeDead
+		if perm != nil {
+			outcome = outcomePermanent
+		}
+		err = w.store.Bury(sctx, t, handleErr.Error())
 		if err == nil {
 			w.log.ErrorContext(ctx, "task moved to dead state", append(attrs, "err", handleErr)...)
 		}
@@ -201,19 +206,21 @@ func (w *Worker) settle(ctx context.Context, t ports.Task, handleErr error) {
 			// The downstream system asked us to wait; never come back sooner.
 			delay = max(delay, hint.After)
 		}
-		err, result = w.store.Retry(sctx, t, now.Add(delay), handleErr.Error()), "retried"
+		err, outcome = w.store.Retry(sctx, t, now.Add(delay), handleErr.Error()), outcomeRetry
 		if err == nil {
 			w.log.WarnContext(ctx, "task failed, will retry", append(attrs, "err", handleErr, "retry_in", delay)...)
 		}
 	}
 
+	// An outcome is counted only once it is recorded: a lost lease or a
+	// failed settle means the task will run again and be counted then.
 	switch {
 	case errors.Is(err, ports.ErrLeaseLost):
-		stats.Add("lease_lost", 1)
+		w.metrics.leaseLost.Inc()
 		w.log.WarnContext(ctx, "task lease lost; result discarded", attrs...)
 	case err != nil:
 		w.log.ErrorContext(ctx, "settle task failed; it runs again when the lease expires", append(attrs, "err", err)...)
 	default:
-		stats.Add(result, 1)
+		w.metrics.attempts.WithLabelValues(string(t.Kind), outcome).Inc()
 	}
 }

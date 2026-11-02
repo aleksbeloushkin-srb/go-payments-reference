@@ -16,6 +16,7 @@ type Registry struct {
 	count   int
 	limit   int
 	closed  bool
+	metrics *Metrics
 }
 
 type waiter struct {
@@ -26,8 +27,8 @@ type waiter struct {
 }
 
 // NewRegistry returns a registry that accepts at most limit waiters.
-func NewRegistry(limit int) *Registry {
-	return &Registry{waiters: make(map[uuid.UUID]map[*waiter]struct{}), limit: limit}
+func NewRegistry(limit int, m *Metrics) *Registry {
+	return &Registry{waiters: make(map[uuid.UUID]map[*waiter]struct{}), limit: limit, metrics: m}
 }
 
 // Watch registers a waiter for id. See ports.Watcher.
@@ -38,6 +39,7 @@ func (r *Registry) Watch(id uuid.UUID, seen int64) (<-chan int64, func(), error)
 		return nil, nil, ports.ErrUnavailable
 	}
 	if r.count >= r.limit {
+		r.metrics.rejected.Inc()
 		return nil, nil, ports.ErrTooManyWaiters
 	}
 	w := &waiter{seen: seen, ch: make(chan int64, 1)}
@@ -48,6 +50,7 @@ func (r *Registry) Watch(id uuid.UUID, seen int64) (<-chan int64, func(), error)
 	}
 	set[w] = struct{}{}
 	r.count++
+	r.metrics.waiters.Set(float64(r.count))
 	return w.ch, func() { r.remove(id, w) }, nil
 }
 
@@ -73,6 +76,7 @@ func (r *Registry) drop(id uuid.UUID, w *waiter) {
 		delete(r.waiters, id)
 	}
 	r.count--
+	r.metrics.waiters.Set(float64(r.count))
 }
 
 // IDs returns the payment ids that currently have waiters.
@@ -126,4 +130,5 @@ func (r *Registry) Close() {
 		delete(r.waiters, id)
 	}
 	r.count = 0
+	r.metrics.waiters.Set(0)
 }

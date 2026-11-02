@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/outbox"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
@@ -90,7 +91,7 @@ func TestRelayFailureMarksOnlyPublishedEvents(t *testing.T) {
 		seen = append(seen, r.ID)
 		return nil
 	})
-	relay := outbox.NewRelay(e.outbox, pub, e.clock, nil, relayConfig(10), discard())
+	relay := outbox.NewRelay(e.outbox, pub, e.clock, nil, outbox.NewMetrics(prometheus.NewRegistry()), relayConfig(10), discard())
 
 	if n, err := relay.RunOnce(context.Background()); err == nil || n != 1 {
 		t.Fatalf("first batch = %d, %v; want 1 and an error", n, err)
@@ -117,7 +118,7 @@ func TestRelayHoldsNoConnectionWhilePublishing(t *testing.T) {
 		return nil
 	})
 
-	if _, err := outbox.NewRelay(e.outbox, pub, e.clock, nil, relayConfig(10), discard()).RunOnce(context.Background()); err != nil {
+	if _, err := outbox.NewRelay(e.outbox, pub, e.clock, nil, outbox.NewMetrics(prometheus.NewRegistry()), relayConfig(10), discard()).RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(acquired, []int32{0, 0}) {
@@ -154,11 +155,11 @@ func TestConcurrentRelaysPublishEachEventOnce(t *testing.T) {
 
 	done := make(chan error)
 	go func() {
-		_, err := outbox.NewRelay(e.outbox, slow, e.clock, nil, relayConfig(3), discard()).RunOnce(context.Background())
+		_, err := outbox.NewRelay(e.outbox, slow, e.clock, nil, outbox.NewMetrics(prometheus.NewRegistry()), relayConfig(3), discard()).RunOnce(context.Background())
 		done <- err
 	}()
 	<-started
-	if n, err := outbox.NewRelay(e.outbox, fast, e.clock, nil, relayConfig(10), discard()).RunOnce(context.Background()); err != nil || n != 3 {
+	if n, err := outbox.NewRelay(e.outbox, fast, e.clock, nil, outbox.NewMetrics(prometheus.NewRegistry()), relayConfig(10), discard()).RunOnce(context.Background()); err != nil || n != 3 {
 		t.Fatalf("second relay published %d, %v; want the 3 unclaimed events", n, err)
 	}
 	close(release)

@@ -31,11 +31,12 @@ func startAPI(t *testing.T, e *env) *httptest.Server {
 		WebhookSecret: []byte("0123456789abcdef"),
 		Static:        fstest.MapFS{},
 		Clock:         e.clock,
+		Metrics:       httpapi.NewMetrics(prometheus.NewRegistry()),
 		Logger:        discard(),
 	}))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
-	b := longpoll.NewBatcher(e.waiters, e.payments, longpoll.BatcherConfig{Interval: 20 * time.Millisecond, QueryTimeout: time.Second}, discard())
+	b := longpoll.NewBatcher(e.waiters, e.payments, longpoll.NewMetrics(prometheus.NewRegistry()), longpoll.BatcherConfig{Interval: 20 * time.Millisecond, QueryTimeout: time.Second}, discard())
 	go func() { done <- b.Run(ctx) }()
 	t.Cleanup(func() {
 		cancel()
@@ -121,7 +122,7 @@ func TestLongPollSoftTimeout(t *testing.T) {
 
 func TestLongPollRegistryFull(t *testing.T) {
 	e := newEnv(t, app.Config{})
-	e.waiters = longpoll.NewRegistry(1)
+	e.waiters = longpoll.NewRegistry(1, longpoll.NewMetrics(prometheus.NewRegistry()))
 	e.svc = app.NewService(app.Deps{
 		Tx: e.tx, Payments: e.payments, Tasks: e.tasks, Events: e.outbox, Gateway: e.gateway,
 		Watcher: e.waiters, Clock: e.clock, Metrics: metrics.NewBusiness(prometheus.NewRegistry()), NewID: newV7, Logger: discard(),

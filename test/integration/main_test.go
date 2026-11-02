@@ -98,7 +98,7 @@ func newEnv(t *testing.T, cfg app.Config) *env {
 		tasks:    postgres.NewTasks(tx),
 		outbox:   postgres.NewOutbox(tx),
 		gateway:  &fakeGateway{},
-		waiters:  longpoll.NewRegistry(100),
+		waiters:  longpoll.NewRegistry(100, longpoll.NewMetrics(prometheus.NewRegistry())),
 		clock:    &clock{now: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)},
 	}
 	if cfg == (app.Config{}) {

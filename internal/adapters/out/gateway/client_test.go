@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/domain/payment"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
@@ -37,7 +39,7 @@ func newClient(t *testing.T, url string, cfg Config) (*Client, *recorder) {
 	if cfg.CallTimeout == 0 {
 		cfg.CallTimeout = 2 * time.Second
 	}
-	c, err := NewClient(cfg, &http.Client{})
+	c, err := NewClient(cfg, &http.Client{}, NewMetrics(prometheus.NewRegistry()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,6 +276,64 @@ func TestLongRetryAfterIsPassedOn(t *testing.T) {
 	var hint *ports.RetryAfterError
 	if !errors.As(err, &hint) || hint.After != time.Minute {
 		t.Fatalf("err = %v, want a RetryAfterError of 1m", err)
+	}
+}
+
+// Every HTTP exchange is counted with its classified outcome, in-line
+// retries included.
+func TestGatewayMetricsOutcomes(t *testing.T) {
+	tests := []struct {
+		code    int
+		outcome string
+	}{
+		{http.StatusCreated, "ok"},
+		{http.StatusPaymentRequired, "declined"},
+		{http.StatusConflict, "ambiguous"},
+		{http.StatusInternalServerError, "ambiguous"},
+		{http.StatusUnauthorized, "misconfigured"},
+		{http.StatusRequestTimeout, "error"},
+	}
+	for _, tt := range tests {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if tt.code == http.StatusCreated {
+				writeJSON(w, tt.code, paymentResponse{Ref: "gw_1", Status: "processing"})
+				return
+			}
+			w.WriteHeader(tt.code)
+		}))
+		c, _ := newClient(t, srv.URL, Config{})
+		_, _ = c.CreatePayment(context.Background(), request())
+		srv.Close()
+
+		if got := testutil.ToFloat64(c.metrics.requests.WithLabelValues(opCreate, tt.outcome)); got != 1 {
+			t.Errorf("status %d: gateway_requests_total{outcome=%q} = %v, want 1", tt.code, tt.outcome, got)
+		}
+		if n := testutil.CollectAndCount(c.metrics.duration); n != 1 {
+			t.Errorf("status %d: duration series = %d, want 1", tt.code, n)
+		}
+	}
+}
+
+func TestGatewayMetricsCountInlineRetries(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writeJSON(w, http.StatusCreated, paymentResponse{Ref: "gw_1", Status: "processing"})
+	}))
+	defer srv.Close()
+	c, _ := newClient(t, srv.URL, Config{MaxRetries: 1, MaxRetryAfter: 5 * time.Second})
+
+	if _, err := c.CreatePayment(context.Background(), request()); err != nil {
+		t.Fatal(err)
+	}
+	if rl, ok := testutil.ToFloat64(c.metrics.requests.WithLabelValues(opCreate, "rate_limited")),
+		testutil.ToFloat64(c.metrics.requests.WithLabelValues(opCreate, "ok")); rl != 1 || ok != 1 {
+		t.Fatalf("rate_limited = %v, ok = %v; want 1 and 1", rl, ok)
 	}
 }
 

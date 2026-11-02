@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
 
@@ -81,7 +84,7 @@ func records(ids ...int64) []ports.OutboxRecord {
 var testConfig = Config{Interval: time.Hour, Batch: 10, Lease: time.Minute, PublishTimeout: 5 * time.Second}
 
 func newRelay(store Store, pub Publisher, clock ports.Clock) *Relay {
-	return NewRelay(store, pub, clock, nil, testConfig, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewRelay(store, pub, clock, nil, NewMetrics(prometheus.NewRegistry()), testConfig, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func newClock() *stepClock { return &stepClock{now: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)} }
@@ -104,10 +107,14 @@ func TestRelayStopsAtFirstFailureAndReleasesTheRest(t *testing.T) {
 	store := &fakeStore{pending: records(1, 2, 3)}
 	pub := &fakePublisher{failOn: 2}
 
-	n, err := newRelay(store, pub, newClock()).RunOnce(context.Background())
+	relay := newRelay(store, pub, newClock())
+	n, err := relay.RunOnce(context.Background())
 
 	if err == nil || n != 1 {
 		t.Fatalf("RunOnce = %d, %v; want 1 and an error", n, err)
+	}
+	if p, f := testutil.ToFloat64(relay.metrics.published), testutil.ToFloat64(relay.metrics.failed); p != 1 || f != 1 {
+		t.Fatalf("outbox_published_total = %v, outbox_failed_total = %v; want 1 and 1", p, f)
 	}
 	if !slices.Equal(store.marked, []int64{1}) || !slices.Equal(store.released, []int64{2, 3}) {
 		t.Fatalf("marked %v, released %v", store.marked, store.released)
