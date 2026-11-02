@@ -203,7 +203,7 @@ sequenceDiagram
         G-->>S: processing, gw_ref
         S->>DB: tx2: lock payment, attempt n still open?
         S->>DB: transition (version + 1), outbox event, poll task, attempt n done, COMMIT
-    else 409 or 425, key in progress
+    else 409, 425, or connection lost after writing
         S-->>W: retry later, same attempt and key
     else ambiguous (timeout, reset, 5xx)
         S->>DB: attempt n unknown, reconcile_payment task, COMMIT

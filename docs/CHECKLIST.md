@@ -51,10 +51,10 @@ IMPROVEMENTS.md.
 
 - [x] Every call has a per-call deadline derived from the caller's context; `http.Client.Timeout` is only a backstop.
 - [x] One tuned `http.Client` per upstream (`MaxIdleConnsPerHost` raised from the default of 2); response bodies are drained and closed.
-- [x] Only requests that were definitely not executed are retried in-line (429, dial errors). Ambiguous outcomes are not retried blindly.
+- [x] Only requests that were definitely not executed are retried in-line (429, a dial error with nothing written, as recorded by an `httptrace.ClientTrace`). Ambiguous outcomes are not retried blindly.
 - [x] `Retry-After` is honoured, capped, and never waited for past the caller's deadline; a longer one is passed to the task queue as the minimum retry delay.
 - [x] Retries live on one layer per concern: the client retries "not executed", the task queue retries everything else with backoff.
-- [x] Errors are classified: unavailable (retry), declined (do not retry; only explicit decline codes), ambiguous (retry only with the same idempotency key, including "same key in progress"), misconfigured (retry and alert, never fail the payment), not ready yet (postpone without spending an attempt).
+- [x] Errors are classified: unavailable (retry), declined (do not retry; only explicit decline codes), ambiguous (retry only with the same idempotency key; 409, 425 and a connection lost after writing always resend the same key), misconfigured (retry and alert, never fail the payment), not ready yet (postpone without spending an attempt).
 - [ ] Circuit breaker or bulkhead per upstream (IMPROVEMENTS.md, item 9).
 
 ## Idempotency

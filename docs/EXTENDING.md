@@ -23,9 +23,12 @@ adapter that implements the same two methods.
    | --- | --- | --- |
    | 2xx with a known status | success | |
    | 429, or 503 that the gateway documents as "not processed" | `ErrGatewayUnavailable`, retry after `Retry-After` (in-line if short, otherwise as a `RetryAfterError` hint for the worker) | the request was refused before execution |
-   | dial error, DNS failure, 408 | `ErrGatewayUnavailable`, retry | nothing was executed |
-   | an explicit decline: 400, 402, 422 with a decline body | `ErrGatewayRejected` | retrying will not help; the payment fails |
-   | 409 or 425 "a request with this key is in progress" | `ErrGatewayAmbiguous`, retry later with the same key | the first request may still succeed |
+   | dial error or DNS failure before anything was written, 408 | `ErrGatewayUnavailable`, retry | nothing was executed |
+   | connection error after the request was written, including a dial error from net/http's replay of a request with an `Idempotency-Key` | `ErrGatewayAmbiguous` and `ErrGatewayResendSameKey`, resend later with the same key | the gateway may hold the request; "written" comes from an `httptrace.ClientTrace`, not from the error type |
+   | an explicit decline: 400, 402, 422 other than a key reuse | `ErrGatewayRejected` | retrying will not help; the payment fails |
+   | 409 "a request with this key is in progress" | `ErrGatewayAmbiguous` and `ErrGatewayResendSameKey`, retry later with the same key | the first request may still succeed |
+   | 425 Too Early (RFC 8470) | `ErrGatewayAmbiguous` and `ErrGatewayResendSameKey` | the gateway would not process the request yet and expects it again |
+   | 422 with the gateway's "key reused with a different body" code | `ErrGatewayUnavailable` and `ErrGatewayMisconfigured`, retry and alert | our body for a key never changes, so this is a bug or a key collision, never a decline; a gateway that signals it differently (Stripe-like APIs use 400 with an idempotency error type) needs its own check |
    | 401, 403, 404 on a create, 405, any other 4xx | `ErrGatewayUnavailable` and `ErrGatewayMisconfigured`, retry and alert | our credentials or URL are wrong, not the payment; failing it would turn a configuration mistake into lost sales |
    | 5xx, timeout after sending, reset connection, unreadable 2xx | `ErrGatewayAmbiguous` | the payment may have gone through |
 

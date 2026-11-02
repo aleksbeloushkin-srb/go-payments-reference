@@ -116,7 +116,8 @@ the data model and sequence diagrams for every flow are in
    `n` and its key (the payment id for attempt 1, `<payment id>:<n>` after
    an abandoned attempt) in a short transaction, calls the gateway with no
    transaction open, and applies the answer in a second short transaction.
-   A 409 "in progress" keeps the key for a retry; an ambiguous answer marks
+   A 409, a 425 or a connection lost after the request was written keeps
+   the key for a retry; any other ambiguous answer marks
    the attempt `unknown`, and a `reconcile_payment` task looks the payment
    up at the gateway. This is
    v2; the v1 start, which calls inside the transaction, is kept for
