@@ -11,6 +11,13 @@ var (
 	// full. The HTTP layer answers 429 with Retry-After.
 	ErrTooManyWaiters = errors.New("too many waiters")
 
+	// ErrAttemptNotFound means the gateway attempt does not exist.
+	ErrAttemptNotFound = errors.New("gateway attempt not found")
+
+	// ErrAttemptChanged means the attempt left the expected state, so the
+	// caller's view of it is stale.
+	ErrAttemptChanged = errors.New("gateway attempt changed")
+
 	// ErrUnavailable means the instance is shutting down or otherwise cannot
 	// serve the request right now. The HTTP layer answers 503.
 	ErrUnavailable = errors.New("temporarily unavailable")

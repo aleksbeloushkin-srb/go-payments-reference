@@ -79,6 +79,7 @@ type env struct {
 	payments *postgres.Payments
 	tasks    *postgres.Tasks
 	outbox   *postgres.Outbox
+	attempts *postgres.Attempts
 	gateway  *fakeGateway
 	waiters  *longpoll.Registry
 	clock    *clock
@@ -88,7 +89,7 @@ type env struct {
 func newEnv(t *testing.T, cfg app.Config) *env {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := pool.Exec(ctx, `TRUNCATE payments, tasks, outbox RESTART IDENTITY`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE payments, tasks, outbox, gateway_attempts RESTART IDENTITY`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	tx := txctx.New(pool)
@@ -97,6 +98,7 @@ func newEnv(t *testing.T, cfg app.Config) *env {
 		payments: postgres.NewPayments(tx),
 		tasks:    postgres.NewTasks(tx),
 		outbox:   postgres.NewOutbox(tx),
+		attempts: postgres.NewAttempts(tx),
 		gateway:  &fakeGateway{},
 		waiters:  longpoll.NewRegistry(100, longpoll.NewMetrics(prometheus.NewRegistry())),
 		clock:    &clock{now: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)},
