@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/httpapi"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/outbox"
@@ -39,6 +40,10 @@ import (
 	"github.com/aleksbeloushkin-srb/go-payments-reference/pkg/txctx"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/web"
 )
+
+// metricsQueryTimeout bounds the database query behind the queue gauges,
+// well below the default Prometheus scrape timeout of 10 s.
+const metricsQueryTimeout = 2 * time.Second
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
@@ -101,6 +106,15 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 	// Metrics live on a registry owned by this function and injected into
 	// every component that records them; nothing uses the global default.
 	reg := prometheus.NewRegistry()
+
+	// Process-wide collectors: Go runtime, process, the pool, and the queue
+	// gauges read from the database on each scrape.
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		postgres.NewPoolCollector(pool),
+		postgres.NewQueueCollector(pool, metricsQueryTimeout, log),
+	)
 
 	// Adapters.
 	clock := platform.SystemClock{}
