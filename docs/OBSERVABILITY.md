@@ -55,6 +55,7 @@ make check-alerts                # promtool: config check and alert rule tests
 | `gateway_attempts` | gauge | `state` | Open gateway attempts of the two-phase start, `intent` and `unknown`. Done and abandoned attempts are terminal and only grow; abandons are counted by `reconcile_total`. |
 | `gateway_attempt_oldest_open_seconds` | gauge | none | Age of the oldest `intent` or `unknown` attempt; 0 when none. |
 | `reconcile_total` | counter | `outcome` | Reconciliations of ambiguous attempts: `found` (an answer applied), `not_found`, `abandoned`, `duplicate`, `error`. |
+| `gateway_charge_mismatches_total` | counter | none | Times the duplicate check found a gateway charge for a payment we report failed or canceled: the client was charged although we said no. |
 | `gateway_duplicates_detected_total` | counter | none | Times the gateway was found holding more than one payment for one bank payment, by reconciliation or by the duplicate check after an abandoned attempt: a double charge to refund. |
 | `metrics_collect_errors_total` | counter | none | Scrapes in which the database gauges could not be read. |
 | `outbox_published_total` | counter | none | Events published and marked. |
@@ -106,6 +107,7 @@ real traffic.
 | `OutboxLag` | `max(outbox_oldest_unpublished_seconds) > 60` | 5m | Check that the relay runs and `outbox_failed_total`; a failing subscriber blocks the outbox. |
 | `GatewayAmbiguousRatio` | `sum by (op) (rate(gateway_requests_total{outcome="ambiguous"}[10m])) / sum by (op) (rate(gateway_requests_total[10m])) > 0.05` | 10m | Check gateway latency and 5xx; payments stay pending and are retried with the same key. |
 | `GatewayAttemptStuck` | `max(gateway_attempt_oldest_open_seconds) > 300` | 5m | Check `reconcile_total{outcome="error"}` and the gateway lookup. If the attempt's `reconcile_payment` task is dead, fix the cause and requeue that task (`UPDATE tasks SET state = 'ready', attempts = 0, run_after = now() WHERE id = ...`); re-running `start_payment` does not revive it, because its dedup key already exists. |
+| `GatewayChargeMismatch` | `sum(increase(gateway_charge_mismatches_total[15m])) > 0` | none | Find "gateway holds a charge for a payment we report" in the logs for the payment id and the gateway charges; refund the charge or correct the payment with the gateway, then close the dead task. |
 | `GatewayDuplicateCharge` | `sum(increase(gateway_duplicates_detected_total[15m])) > 0` | none | Find "gateway holds several payments" in the logs for the payment id and the gateway references, refund the extra gateway payment with the gateway's tools, then close the dead task. |
 | `GatewayMisconfigured` | `sum(increase(gateway_requests_total{outcome="misconfigured"}[5m])) > 0` | none | Check `PAYMENTS_GATEWAY_URL` and the gateway credentials; affected payments wait in `pending`. |
 | `HTTP5xxRatio` | `sum(rate(http_requests_total{code=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.01` | 10m | Find "request failed" errors in the logs by route; then check the database. |

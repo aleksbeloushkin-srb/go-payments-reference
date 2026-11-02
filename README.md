@@ -211,7 +211,8 @@ What the numbers say, and what they do not:
   18); dashboards and rules that use `le` across the upgrade see a
   discontinuity. New series: `gateway_attempts`,
   `gateway_attempt_oldest_open_seconds`, `reconcile_total`,
-  `gateway_duplicates_detected_total`, `task_duration_seconds`.
+  `gateway_duplicates_detected_total`, `gateway_charge_mismatches_total`,
+  `task_duration_seconds`.
 - **Schema.** Migration 00004 adds `gateway_attempts`; it runs at start.
 
 ## How to read the code

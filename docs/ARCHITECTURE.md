@@ -231,10 +231,13 @@ the gateway again.
 **Duplicate check.** An attempt that follows an abandoned one may coexist
 with a late payment for the abandoned key. When such an attempt settles, a
 `check_duplicates` task looks the payment up after
-`PAYMENTS_DUPLICATE_CHECK_DELAY`; more than one gateway payment counts
-`gateway_duplicates_detected_total`, pages `GatewayDuplicateCharge` and goes
-dead with the gateway references in the log. Refunding is an operator
-action.
+`PAYMENTS_DUPLICATE_CHECK_DELAY` and compares the gateway's charges (its
+payments that are neither failed nor canceled) with our record. A second
+charge counts `gateway_duplicates_detected_total` and pages
+`GatewayDuplicateCharge`; a charge for a payment we report failed or
+canceled counts `gateway_charge_mismatches_total` and pages
+`GatewayChargeMismatch`. Both leave a dead task with the gateway references
+in the log. Refunding is an operator action.
 
 ### Start a payment (v1, `in_tx`: gateway call inside the transaction)
 
