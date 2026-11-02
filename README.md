@@ -63,7 +63,7 @@ curl -X POST 'localhost:9090/_control?faults=hang'      # executes, then never a
 curl -X POST 'localhost:9090/_control?faults=500'       # 500 before executing
 curl -X POST 'localhost:9090/_control?faults=409,401'   # "same key in progress", then "bad credentials"
 curl -X POST 'localhost:9090/_control?webhook=drop'     # or duplicate, or normal
-curl -X POST 'localhost:9090/_control?latency=300ms'
+curl -X POST 'localhost:9090/_control?latency=300ms'   # answer late, after executing
 curl localhost:9090/_control                            # current settings and counters
 ```
 
@@ -112,10 +112,13 @@ the data model and sequence diagrams for every flow are in
 1. **Create.** `POST /v1/payments` with an `Idempotency-Key`. One
    transaction inserts the payment (or finds the existing one for the key),
    a `start_payment` task and a `payment.created` event.
-2. **Start.** The worker claims the task with a lease and calls the gateway
-   with the payment id as the idempotency key. In version 1 this call runs
-   inside the database transaction while the payment row is locked; that is
-   the main deliberate weakness, explained in REVIEW.md.
+2. **Start.** The worker claims the task with a lease. It records attempt
+   `n` and its key `<payment id>:<n>` in a short transaction, calls the
+   gateway with no transaction open, and applies the answer in a second
+   short transaction. An ambiguous answer marks the attempt `unknown`; a
+   `reconcile_payment` task then looks the payment up at the gateway. This is
+   v2; the v1 start, which calls inside the transaction, is kept for
+   comparison (see "v1 to v2").
 3. **Poll.** Every payment that is not final has a `poll_payment` task,
    whichever path made it non-final. While the gateway reports a non-final
    status, the task is rescheduled. No goroutine sleeps.
@@ -135,13 +138,64 @@ the data model and sequence diagrams for every flow are in
    on a separate admin listener; alert rules live in `deploy/prometheus/`
    ([docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)).
 
+## v1 to v2
+
+v1 (the `v1` tag) called the gateway inside the database transaction, under
+the payment's row lock: simple, and costly while the gateway is slow (REVIEW.md,
+W1). v2 implements [proposal 0001](docs/proposals/0001-gateway-call-outside-transaction.md):
+the attempt is committed before the call, the call runs with no
+transaction, connection or row lock held, and ambiguous answers are settled
+by reconciliation. Both starts stay selectable:
+
+```sh
+PAYMENTS_START_MODE=in_tx docker compose up --build   # v1; two_phase is the default
+START_MODE=in_tx make e2e                              # the end-to-end script in v1 mode
+make compare                                           # both modes under a slow gateway
+```
+
+`scripts/compare-start-modes.sh` runs each mode against a fake gateway that
+executes a payment, sends its webhook after 200 ms and answers the create
+call after `LATENCY`, with 9 workers and a pool of 12 connections, and reads
+the numbers from `/metrics`. Measured on a laptop with Docker in a VM
+(colima); expect different absolute numbers elsewhere:
+
+| Setup | Mode | Pool acquisitions that waited | Pool wait, s total | p95 create to final, s | p95 `POST /v1/payments`, s | Webhook accepted to applied, mean s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 60 payments, 20 clients, 1 s latency | `in_tx` | 53 | 0.27 | 4.50 | 0.050 | 3.07 |
+| | `two_phase` | 19 | 0.21 | 4.57 | 0.062 | 3.07 |
+| 80 payments, 40 clients, 2 s latency | `in_tx` | 114 | 0.20 | 28.2 | 0.024 | 9.5 |
+| | `two_phase` | 10 | 0.13 | 27.9 | 0.035 | 11.0 |
+
+What the numbers say:
+
+- **The pool is relieved.** In v1 each running start holds a connection for
+  the whole call, so other work waits for connections 5 to 11 times as
+  often. With a busier API or a smaller pool, those waits become latency
+  and timeouts; v2 removes the cause. The integration test
+  `TestNoConnectionHeldDuringTheCall` shows it directly: one connection
+  acquired and one session idle in a transaction during the call in v1, none
+  in v2.
+- **Latency does not improve here, and that is expected.** Both modes keep
+  a worker slot busy for the whole call, so throughput is `workers /
+  latency` either way, and the worker's batch barrier (REVIEW.md, W3) holds
+  webhook tasks behind the start calls. The row lock that v1 holds never
+  delays a webhook in this setup, because the webhook's task is claimed only
+  after the batch, when the lock is gone. Continuous claiming
+  (IMPROVEMENTS.md, item 4) is what turns v2's freed resources into lower
+  latency.
+- **Correctness differs where the numbers do not show it.** After a crash
+  between the gateway's success and our commit, v1 has no record that a
+  call happened; v2 has an attempt that reconciliation settles. The fault
+  "execute, then hang" ends with exactly one gateway execution in both modes
+  in the end-to-end script, but only v2 knows why.
+
 ## How to read the code
 
 | Step | Where | What to look for |
 | --- | --- | --- |
 | 1 | [`internal/domain/payment`](internal/domain/payment) | `Payment`, `Money`, the transition table, `TransitionTo` |
 | 2 | [`internal/ports`](internal/ports) | the interfaces the use cases need; error classes; `RetryLater` and `Permanent` |
-| 3 | [`internal/app`](internal/app) | `create.go`, `start.go` (version 1 trade-off), `poll.go`, `event.go`, `query.go` (long poll), `status.go` |
+| 3 | [`internal/app`](internal/app) | `create.go`, `start_two_phase.go` and `reconcile.go` (v2 start), `start.go` (v1 start, for comparison), `poll.go`, `event.go`, `query.go` (long poll), `status.go` |
 | 4 | [`pkg/txctx`](pkg/txctx) | transaction in the context: `Run`, `DB`, `AfterCommit` |
 | 5 | [`internal/adapters/out/postgres`](internal/adapters/out/postgres) | idempotent insert, claim with `SKIP LOCKED` and leases, fenced settle, outbox |
 | 6 | [`internal/adapters/in/queue`](internal/adapters/in/queue) | claim loop, backoff with jitter, dead state, shutdown behaviour |
@@ -163,7 +217,8 @@ the data model and sequence diagrams for every flow are in
 | Task queue: `SKIP LOCKED`, lease, fencing token | [`internal/adapters/out/postgres/tasks.go`](internal/adapters/out/postgres/tasks.go) |
 | Retries with backoff and jitter, dead-letter state | [`internal/adapters/in/queue/worker.go`](internal/adapters/in/queue/worker.go), [`backoff.go`](internal/adapters/in/queue/backoff.go) |
 | Polling as a delayed retry | [`internal/app/poll.go`](internal/app/poll.go) |
-| Gateway call inside a transaction (version 1 weakness) | [`internal/app/start.go`](internal/app/start.go) |
+| Gateway call outside any transaction, attempt committed first, reconciliation by lookup (v2) | [`internal/app/start_two_phase.go`](internal/app/start_two_phase.go), [`internal/app/reconcile.go`](internal/app/reconcile.go), [`migrations/00004_gateway_attempts.sql`](migrations/00004_gateway_attempts.sql) |
+| Gateway call inside a transaction (v1, `PAYMENTS_START_MODE=in_tx`) | [`internal/app/start.go`](internal/app/start.go) |
 | Retry only what was not executed; decline only on explicit decline codes | [`internal/adapters/out/gateway/client.go`](internal/adapters/out/gateway/client.go) |
 | Webhook signature with replay window | [`pkg/hmacsig/hmacsig.go`](pkg/hmacsig/hmacsig.go), [`internal/adapters/in/httpapi/events.go`](internal/adapters/in/httpapi/events.go) |
 | Inbox deduplication by event id | [`internal/app/event.go`](internal/app/event.go) |
@@ -231,6 +286,13 @@ Compose versions that build through `buildx bake` also need the
 Delete the override file once the network is fixed; it is not the default
 on purpose.
 
+If module downloads inside the build fail even on the host network, build
+the binaries on the host
+(`CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o dist/ ./cmd/...`, with the
+architecture of the Docker VM) and point the override's `build` at a local
+Dockerfile in the git-ignored `dist/` that copies them onto
+`gcr.io/distroless/static-debian12:nonroot`.
+
 ## Configuration
 
 All settings come from the environment and are validated at start: an
@@ -256,6 +318,8 @@ reference service; each has its reason in
 | `PAYMENTS_TASK_LEASE` / `_TIMEOUT` / `_MAX_ATTEMPTS` | `60s` / `30s` / `12` | lease, handler deadline, attempts before the dead state |
 | `PAYMENTS_TASK_RETRY_BASE` / `_RETRY_MAX` | `500ms` / `2m` | exponential backoff bounds |
 | `PAYMENTS_POLL_INTERVAL` / `_POLL_TIMEOUT` | `3s` / `2h` | gateway polling cadence and give-up age |
+| `PAYMENTS_START_MODE` | `two_phase` | `two_phase` (v2) or `in_tx` (v1, for comparison); any other value stops the start |
+| `PAYMENTS_RECONCILE_INTERVAL` / `_NOT_FOUND_LIMIT` | `5s` / `3` | spacing of lookups of an ambiguous attempt, and certain "not found" answers before it is abandoned |
 | `PAYMENTS_WAIT_TIMEOUT` / `_READ_TIMEOUT` / `_MAX_WAITERS` / `_BATCH_INTERVAL` | `15s` / `2s` / `2000` / `200ms` | long-poll soft timeout, bound on each database read, per-instance cap, batcher tick |
 | `PAYMENTS_RELAY_INTERVAL` / `_BATCH` / `_LEASE` | `500ms` / `50` / `1m` | outbox relay cadence, batch size, claim lease |
 | `PAYMENTS_EVENTS_WEBHOOK_URL` / `_TIMEOUT` | empty / `5s` | optional subscriber for outbox events; per-delivery timeout (the lease must be at least twice as long) |

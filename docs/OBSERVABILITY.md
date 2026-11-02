@@ -45,16 +45,20 @@ make check-alerts                # promtool: config check and alert rule tests
 | `tasks_claimed_total` | counter | `kind` | Tasks claimed by this worker. |
 | `task_attempts_total` | counter | `kind`, `outcome` | Settled runs: `ok` (done or postponed by polling), `retry`, `permanent` (dead at once), `dead` (out of attempts). |
 | `task_lag_seconds` | histogram | `kind` | Claim time minus `run_after`: how long a due task waited. |
+| `task_duration_seconds` | histogram | `kind` | Handler run time, including row-lock waits and gateway calls. For `apply_gateway_event` it is the time to apply a webhook. |
 | `lease_lost_total` | counter | none | Results discarded because another worker took over the lease. |
 | `task_panics_total` | counter | none | Recovered handler panics. |
 | `tasks_ready` | gauge | `kind` | Tasks in the ready state, including those scheduled for later. |
 | `tasks_dead` | gauge | `kind` | Tasks in the dead state, waiting for an operator. |
 | `task_oldest_ready_seconds` | gauge | none | Age of the oldest due, unfinished task; 0 when none. |
 | `outbox_oldest_unpublished_seconds` | gauge | none | Age of the oldest unpublished event; 0 when none. |
+| `gateway_attempts` | gauge | `state` | Gateway attempts of the two-phase start in `intent`, `unknown` and `abandoned`; `done` attempts only grow and are not counted. |
+| `gateway_attempt_oldest_open_seconds` | gauge | none | Age of the oldest `intent` or `unknown` attempt; 0 when none. |
+| `reconcile_total` | counter | `outcome` | Reconciliations of ambiguous attempts: `found`, `not_found`, `abandoned`, `duplicate`, `error`. |
 | `metrics_collect_errors_total` | counter | none | Scrapes in which the database gauges could not be read. |
 | `outbox_published_total` | counter | none | Events published and marked. |
 | `outbox_failed_total` | counter | none | Failed deliveries; the events are released and retried. |
-| `gateway_requests_total` | counter | `op`, `outcome` | One per HTTP exchange with the gateway, in-line retries included. `op` is `create` or `read`; `outcome` is `ok`, `declined`, `rate_limited`, `ambiguous`, `misconfigured` or `error`. |
+| `gateway_requests_total` | counter | `op`, `outcome` | One per HTTP exchange with the gateway, in-line retries included. `op` is `create`, `read` or `lookup` (by reference, for reconciliation); `outcome` is `ok`, `declined`, `rate_limited`, `ambiguous`, `misconfigured` or `error`. |
 | `gateway_request_duration_seconds` | histogram | `op` | Duration of one gateway exchange. |
 | `longpoll_waiters` | gauge | none | Long polls waiting on this instance. |
 | `longpoll_rejected_total` | counter | none | Long polls answered 429 because the instance cap was reached. |
@@ -81,8 +85,9 @@ make check-alerts                # promtool: config check and alert rule tests
   whole database, so aggregate them with `max()`, never `sum()`.
 - **Series that alerts depend on start at zero.** `increase()` and `rate()`
   ignore the first sample of a new series, so a counter that first appears
-  with the value 1 never triggers its alert. Gateway outcomes and the task
-  kinds and outcomes are created at zero when the process starts.
+  with the value 1 never triggers its alert. Gateway outcomes, task kinds
+  and outcomes, and reconcile outcomes are created at zero when the process
+  starts.
 - **A postponed poll counts as `ok`.** The handler ran and the task simply
   runs again later. Postponements are not failures and spend no attempt.
 
@@ -99,10 +104,11 @@ real traffic.
 | `DeadTasks` | `max by (kind) (tasks_dead) > 0` | 1m | Read `last_error` of the dead tasks, fix the cause, then requeue or reconcile with the gateway. |
 | `OutboxLag` | `max(outbox_oldest_unpublished_seconds) > 60` | 5m | Check that the relay runs and `outbox_failed_total`; a failing subscriber blocks the outbox. |
 | `GatewayAmbiguousRatio` | `sum by (op) (rate(gateway_requests_total{outcome="ambiguous"}[10m])) / sum by (op) (rate(gateway_requests_total[10m])) > 0.05` | 10m | Check gateway latency and 5xx; payments stay pending and are retried with the same key. |
+| `GatewayAttemptStuck` | `max(gateway_attempt_oldest_open_seconds) > 300` | 5m | Check `reconcile_total{outcome="error"}` and the gateway lookup; the payment waits in `pending` until the attempt is settled. |
 | `GatewayMisconfigured` | `sum(increase(gateway_requests_total{outcome="misconfigured"}[5m])) > 0` | none | Check `PAYMENTS_GATEWAY_URL` and the gateway credentials; affected payments wait in `pending`. |
 | `HTTP5xxRatio` | `sum(rate(http_requests_total{code=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.01` | 10m | Find "request failed" errors in the logs by route; then check the database. |
 | `HTTPLatencyP99` | `histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))) > 1` | 10m | Long polls are excluded; check pool acquire wait and slow queries. |
-| `DBPoolAcquireWait` | `sum(rate(db_pool_acquire_wait_seconds_total[5m])) / sum(rate(db_pool_acquires_total[5m])) > 0.05` | 10m | The pool is exhausted: look for slow gateway calls holding connections (the v1 start) and `PAYMENTS_DB_MAX_CONNS`. |
+| `DBPoolAcquireWait` | `sum(rate(db_pool_acquire_wait_seconds_total[5m])) / sum(rate(db_pool_acquires_total[5m])) > 0.05` | 10m | The pool is exhausted: check `PAYMENTS_START_MODE` (the `in_tx` start holds a connection during every gateway call), slow queries and `PAYMENTS_DB_MAX_CONNS`. |
 | `MetricsCollectErrors` | `increase(metrics_collect_errors_total[10m]) > 0` | 10m | The queue gauges are missing, so queue alerts are blind; check the database. |
 
 There is no Alertmanager in the local stack: firing alerts are visible in
@@ -120,7 +126,8 @@ the Prometheus UI. A deployment routes `page` alerts to on-call and
    - `method` keeps the standard methods and folds anything else into
      `OTHER`, because clients can invent methods;
    - `code` is the status code;
-   - `kind` comes from `ports.TaskKinds`;
+   - `kind` comes from `ports.TaskKinds`, and the attempt `state` from
+     `ports.AttemptStates`;
    - `outcome`, `op`, `from`, `to` and `status` come from constants in the
      code.
 3. **Histograms multiply.** Each histogram series has about ten buckets, so

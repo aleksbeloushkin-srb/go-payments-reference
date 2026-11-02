@@ -29,8 +29,8 @@ long-poll soft timeout and its two database reads, each bounded by
 `PAYMENTS_WAIT_READ_TIMEOUT`; the task timeout must cover the gateway's worst
 case (three calls and two `Retry-After` waits); the task lease must be longer
 than the task timeout; the database's idle-in-transaction timeout must be
-longer than a task, because version 1 holds a transaction open during the
-gateway call. `platform.Config.validate` checks each of these relations, so a
+longer than a task, because the `in_tx` start (version 1) holds a
+transaction open during the gateway call. `platform.Config.validate` checks each of these relations, so a
 configuration that would cut a long poll short or let a slow task be claimed
 twice does not start.
 

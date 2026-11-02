@@ -10,7 +10,7 @@ outcomes are handled, which several later items build on.
 
 | # | Change | Fixes | Effect | Cost | Risk |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Gateway call outside the transaction, with a recorded intent | W1 | no connection or lock held during network I/O; ambiguous outcomes become explicit | medium | medium |
+| 1 | **Done in v2.** Gateway call outside the transaction, with a recorded intent | W1 | no connection or lock held during network I/O; ambiguous outcomes become explicit | medium | medium |
 | 2 | Event-driven wake-up for long polling (LISTEN/NOTIFY) | W5 | wake-up in milliseconds instead of up to one batch interval | low to medium | low |
 | 3 | Long-poll answers built from the batch query; jittered soft timeout | W5 | no read per woken waiter; no reconnect waves | low | low |
 | 4 | Queue hardening: attempts at claim, continuous claiming, lease heartbeat, requeue tool | W2, W3 | poison tasks stop; no head-of-line blocking | medium | low |
@@ -24,9 +24,16 @@ outcomes are handled, which several later items build on.
 
 ## 1. Gateway call outside the transaction, with a recorded intent
 
-Full design: [proposal 0001](proposals/0001-gateway-call-outside-transaction.md) — options, crash-point table, concurrency, tests and rollout.
+**Done in v2**: `PAYMENTS_START_MODE=two_phase`, the default
+(`internal/app/start_two_phase.go`, `internal/app/reconcile.go`). The full
+design, its crash-point table and the implementation notes are in
+[proposal 0001](proposals/0001-gateway-call-outside-transaction.md); the
+measured effect is in the README, section "v1 to v2". The v1 start remains
+selectable with `PAYMENTS_START_MODE=in_tx` for comparison and is planned to
+be removed after one release. The text below is the plan as written before
+the implementation.
 
-Today `StartPayment` locks the payment row, calls the gateway and commits,
+In v1, `StartPayment` locks the payment row, calls the gateway and commits,
 all in one transaction (`internal/app/start.go`). Version 2 breaks it into
 two short transactions around the call, and records what it is about to do
 before doing it.

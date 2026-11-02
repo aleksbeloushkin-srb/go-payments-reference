@@ -101,6 +101,7 @@ interface "for others to implement".
 | `payments` | `id uuid pk`, `merchant_id`, `amount_minor bigint`, `currency`, `status`, `version bigint`, `gateway_ref null`, `idempotency_key unique`, `request_hash`, `created_at`, `updated_at` | `version` grows by one per status change |
 | `tasks` | `id bigserial`, `kind`, `payment_id`, `dedup_key`, `payload jsonb`, `attempts`, `run_after`, `lease_until null`, `last_error`, `state` (`ready`, `done`, `dead`) | `unique (kind, payment_id, dedup_key)`, partial index on ready tasks |
 | `outbox` | `id bigserial`, `payment_id`, `type`, `payload jsonb`, `created_at`, `published_at null`, `claimed_until null` | partial index on unpublished rows; `claimed_until` is the relay's lease |
+| `gateway_attempts` | `payment_id`, `attempt`, `idempotency_key unique`, `state` (`intent`, `done`, `unknown`, `abandoned`), `gateway_ref null`, `not_found`, `created_at`, `updated_at` | primary key `(payment_id, attempt)`; a partial unique index allows one open (`intent`, `unknown`) attempt per payment |
 
 Money is an integer number of minor units and an ISO 4217 code. Payment ids
 are UUIDv7, so new rows land at the right edge of the primary-key index.
@@ -184,7 +185,47 @@ The payment, its start task and its event commit together, so there is never
 a payment that nobody will start, nor an event about a payment that does not
 exist.
 
-### Start a payment (v1: gateway call inside the transaction)
+### Start a payment (v2, `two_phase`: gateway call outside any transaction)
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant S as app.Service
+    participant DB as PostgreSQL
+    participant G as Gateway
+    W->>DB: claim start_payment (lease)
+    W->>S: StartPayment
+    S->>DB: tx1: lock payment, still pending?
+    S->>DB: reuse the open intent, or insert attempt n (intent), COMMIT
+    Note over S,G: no transaction, connection or row lock held
+    S->>G: POST /v1/payments, Idempotency-Key = payment id:n
+    alt definite answer
+        G-->>S: processing, gw_ref
+        S->>DB: tx2: lock payment, attempt n still open?
+        S->>DB: transition (version + 1), outbox event, poll task, attempt n done, COMMIT
+    else ambiguous (timeout, reset, 5xx, 409)
+        S->>DB: attempt n unknown, reconcile_payment task, COMMIT
+    end
+    W->>DB: mark task done (fenced by lease)
+```
+
+This is the default since v2 and the design of
+[proposal 0001](proposals/0001-gateway-call-outside-transaction.md). The
+attempt row is committed before the call, so after any crash the database
+says which call may have happened and with which key. A gateway event that
+arrives during the call is applied at once, and the late answer of tx2 does
+not move the payment back.
+
+**Reconciliation.** `reconcile_payment` asks the gateway for the payments it
+holds under our reference. One match is applied like tx2; a certain empty
+answer is counted, and after `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` of them the
+attempt is abandoned and a start task for attempt `n+1`, with a new key, is
+enqueued; several matches send the task dead for an operator. While an
+attempt is unknown, a start retry never calls the gateway again.
+
+### Start a payment (v1, `in_tx`: gateway call inside the transaction)
+
+Kept behind `PAYMENTS_START_MODE=in_tx` to compare the two.
 
 ```mermaid
 sequenceDiagram
@@ -206,8 +247,8 @@ sequenceDiagram
     W->>DB: mark task done (fenced by lease)
 ```
 
-This is the deliberate weakness of version 1; REVIEW.md explains its cost and
-IMPROVEMENTS.md the version 2 shape.
+This was the deliberate weakness of version 1 (REVIEW.md, W1); the README
+section "v1 to v2" shows its cost measured against the two-phase start.
 
 ### Poll a payment
 

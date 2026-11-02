@@ -33,14 +33,17 @@ adapter that implements the same two methods.
    the gateway's documentation for its decline codes and for 5xx: some
    promise that a 5xx means "not executed", most do not. When in doubt, it
    is ambiguous.
-4. **Check idempotency support.** This service retries an ambiguous start
-   with the same `Idempotency-Key` (the payment id) and relies on the gateway
-   to return the original result. If a gateway has no idempotency keys, a
-   blind retry can charge a client twice. Then the start must look up the
-   payment by our reference before creating it again (the gateway usually
-   offers a "find by merchant reference" call), or move to the version 2
-   design in IMPROVEMENTS.md, where an ambiguous outcome triggers a lookup
-   instead of a retry.
+4. **Check idempotency and lookup support.** The two-phase start sends
+   `Idempotency-Key: <payment id>:<attempt>` and settles an ambiguous call by
+   looking the payment up by our reference (`FindByReference`), not by
+   calling again. It needs the gateway to support at least one of the two,
+   and lookup is what makes "not found" certain. Check how soon a new
+   payment becomes visible to the lookup and set
+   `PAYMENTS_RECONCILE_INTERVAL` and `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` so
+   that an attempt is abandoned only well after that: abandoning too early
+   and starting attempt `n+1` with a new key is the one way left to charge a
+   client twice. A gateway with neither idempotency keys nor lookup cannot be
+   made safe by any client design.
 5. **Webhooks.** Each gateway signs webhooks its own way. Verify the
    signature before reading the body as JSON, reject old timestamps, and
    deduplicate by the gateway's event id. `pkg/hmacsig` shows one scheme;
@@ -112,17 +115,18 @@ channels plug in at two points.
 | --- | --- | --- |
 | HTTP load | more instances with `PAYMENTS_ROLES=api` behind a load balancer | separate read path for `GET` (replica, cache) |
 | Long-poll connections | raise `PAYMENTS_WAIT_MAX_WAITERS` per instance, add API instances | SSE with the same registry; event-driven wake-up |
-| Task throughput | more `worker` instances; `PAYMENTS_WORKER_CONCURRENCY` | version 2 start flow so a worker does not hold a connection during the gateway call; partition the task table by kind or hash |
-| Gateway latency | nothing in version 1 scales around it: every slow call holds a connection | version 2 start flow, then a bulkhead (separate concurrency limit) per gateway |
+| Task throughput | more `worker` instances; `PAYMENTS_WORKER_CONCURRENCY` (the two-phase start holds no connection during the gateway call) | partition the task table by kind or hash |
+| Gateway latency | the two-phase start holds no connection or lock during the call, so only worker slots are spent | a bulkhead (separate concurrency limit) per gateway, and continuous claiming (IMPROVEMENTS.md, item 4) |
 | Table growth | delete or archive `done` tasks and published outbox rows | time-based partitions, dropped instead of deleted |
 | Event volume | relay batch size, several relays | a broker publisher; one relay per partition of payment ids to keep per-payment order |
 
-Connection budget: with version 1, every running start task holds one
-database connection for the whole gateway call. Keep
-the sum of `PAYMENTS_WORKER_CONCURRENCY`, the API's peak concurrency, the
-batcher and the relay below `PAYMENTS_DB_MAX_CONNS`, and the sum over all
-instances below the database's `max_connections`. The configuration loader
-checks the per-instance part.
+Connection budget: with the two-phase start a worker holds a connection only
+for its two short transactions. With `PAYMENTS_START_MODE=in_tx` every running
+start task holds one database connection for the whole gateway call: keep the
+sum of `PAYMENTS_WORKER_CONCURRENCY`, the API's peak concurrency, the batcher
+and the relay below `PAYMENTS_DB_MAX_CONNS`, and the sum over all instances
+below the database's `max_connections`. The configuration loader checks the
+per-instance part.
 
 Several relays process the outbox concurrently with `SKIP LOCKED`, which
 breaks global ordering: two events of one payment can be published by two

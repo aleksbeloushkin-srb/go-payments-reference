@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Status | Proposed for v2 |
+| Status | Implemented in v2 (`PAYMENTS_START_MODE=two_phase`, the default) |
 | Fixes | [REVIEW.md W1](../REVIEW.md) (deliberate v1 trade-off) |
 | Summary in the plan | [IMPROVEMENTS.md, item 1](../IMPROVEMENTS.md) |
-| Code today | [`internal/app/start.go`](../../internal/app/start.go) |
+| Code | [`internal/app/start_two_phase.go`](../../internal/app/start_two_phase.go), [`internal/app/reconcile.go`](../../internal/app/reconcile.go); the v1 start stays in [`internal/app/start.go`](../../internal/app/start.go) |
 
 ## Context
 
@@ -128,7 +128,7 @@ precondition.
 
 | Area | Change |
 | --- | --- |
-| `migrations/` | `00003_gateway_attempts.sql` |
+| `migrations/` | `00004_gateway_attempts.sql` (00003 was taken by the metrics index) |
 | `internal/ports` | `Attempts` port: open, reuse, close, mark unknown |
 | `internal/app/start.go` | broken into tx1, call, tx2; new `reconcile` task handler |
 | `internal/adapters/out/gateway` | `FindByReference` when the gateway supports it |
@@ -165,3 +165,26 @@ Metrics: attempts by state, age of the oldest `intent` or `unknown` attempt
   fast the gateway becomes consistent; it needs a configurable bound.
 - Should a payment show `processing` while an attempt is `unknown`? This
   proposal keeps `pending` to avoid promising progress that may not exist.
+
+## Implementation notes
+
+What v2 does where the proposal left a choice, and where it differs:
+
+| Topic | Implementation |
+| --- | --- |
+| Reconcile | Lookup by reference only (`GET /v1/payments?reference=`), never a repeated create: a lookup can answer "not found" with certainty, a repeated create cannot tell "executed now" from "executed before". |
+| Abandoning | After `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` (3) certain "not found" answers, `PAYMENTS_RECONCILE_INTERVAL` (5 s) apart. A failed lookup is retried and never counted. A new attempt starts through a start task with the dedup key `start:<n+1>`. |
+| Several matches | The gateway holds more than one payment for one bank payment: the reconcile task goes dead and the error is logged, because only a person can refund the extra charge. |
+| Unknown attempt and start retries | While an attempt is `unknown`, a start retry never calls the gateway; reconciliation owns the attempt. |
+| One open attempt | Enforced by a partial unique index, not only by the row lock. |
+| Payment status | Stays `pending` while an attempt is `unknown`, as proposed. |
+| Call deadline | The worker's task timeout (30 s), validated to be at least 10 s shorter than the lease (60 s). |
+| Rollout | `two_phase` is the default from the start; `in_tx` remains selectable to compare the two (README, "v1 to v2"). |
+| Metrics | `gateway_attempts{state}`, `gateway_attempt_oldest_open_seconds`, `reconcile_total{outcome}`, and the `GatewayAttemptStuck` alert (open attempt older than five minutes). |
+
+Tests: one unit test per crash-point row above, which restarts the handler
+after the crash and checks the final state and that the gateway executed the
+payment once; integration tests for a webhook during the call, two workers
+on an expired lease, and the absence of held connections during the call;
+the end-to-end script runs the "execute, then hang" fault in both modes.
+

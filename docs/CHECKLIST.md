@@ -55,7 +55,7 @@ IMPROVEMENTS.md.
 - [x] `Retry-After` is honoured, capped, and never waited for past the caller's deadline; a longer one is passed to the task queue as the minimum retry delay.
 - [x] Retries live on one layer per concern: the client retries "not executed", the task queue retries everything else with backoff.
 - [x] Errors are classified: unavailable (retry), declined (do not retry; only explicit decline codes), ambiguous (retry only with the same idempotency key, including "same key in progress"), misconfigured (retry and alert, never fail the payment), not ready yet (postpone without spending an attempt).
-- [ ] Circuit breaker or bulkhead per upstream. Planned with the version 2 start flow (IMPROVEMENTS.md).
+- [ ] Circuit breaker or bulkhead per upstream (IMPROVEMENTS.md, item 9).
 
 ## Idempotency
 
@@ -68,7 +68,8 @@ IMPROVEMENTS.md.
 
 ## Database and transactions
 
-- [ ] No network calls between `BEGIN` and `COMMIT`. Violated on purpose by `StartPayment` in version 1 (REVIEW.md, W1). The outbox relay claims with a lease and publishes outside any transaction.
+- [x] No network calls between `BEGIN` and `COMMIT`: the two-phase start (default since v2) records an attempt, commits, calls the gateway, then applies the answer in a second transaction; the relay publishes outside any transaction. The v1 start (`PAYMENTS_START_MODE=in_tx`) still calls inside the transaction, on purpose, for comparison.
+- [x] The intent of an external call is committed before the call, with its idempotency key, so a crash leaves a record of what to check.
 - [x] The `Commit` error is checked; a failed commit is treated as ambiguous in the documentation of `pkg/txctx`.
 - [x] The pool is bounded and larger than the concurrency that can hold connections; validated at start.
 - [x] Server-side limits are set: `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`.
