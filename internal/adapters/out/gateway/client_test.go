@@ -1,12 +1,16 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -173,13 +177,13 @@ func TestRetryPolicy(t *testing.T) {
 			wantErr: ports.ErrGatewayRejected, wantCalls: 1,
 		},
 		{
-			name:    "409 means the same key is still in progress",
+			name:    "409: a request with this key is still in progress",
 			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusConflict) },
 			cfg:     Config{MaxRetries: 2},
 			wantErr: ports.ErrGatewayAmbiguous, wantCalls: 1,
 		},
 		{
-			name:    "425 means the same key is still in progress",
+			name:    "425 Too Early: send the request again",
 			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTooEarly) },
 			cfg:     Config{MaxRetries: 2},
 			wantErr: ports.ErrGatewayAmbiguous, wantCalls: 1,
@@ -247,9 +251,10 @@ func TestRetryPolicy(t *testing.T) {
 // Credentials, routes and unknown 4xx answers are our mistake, not the
 // payment's: the error is "unavailable" (retry) and "misconfigured" (alert),
 // never a decline.
-// 409 and 425 are ambiguous and, in addition, say the key is known to the
-// gateway, so the caller keeps the key instead of abandoning it.
-func TestInProgressIsAmbiguousAndKeepsTheKey(t *testing.T) {
+// 409 (this key is in progress) and 425 (Too Early, send it again) are
+// ambiguous and call for the same request with the same key, so the caller
+// keeps the key instead of abandoning it.
+func TestResendSameKeyAnswers(t *testing.T) {
 	for _, code := range []int{http.StatusConflict, http.StatusTooEarly} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))
 		c, _ := newClient(t, srv.URL, Config{MaxRetries: 2})
@@ -257,8 +262,111 @@ func TestInProgressIsAmbiguousAndKeepsTheKey(t *testing.T) {
 		_, err := c.CreatePayment(context.Background(), request())
 		srv.Close()
 
-		if !errors.Is(err, ports.ErrGatewayAmbiguous) || !errors.Is(err, ports.ErrGatewayInProgress) {
-			t.Errorf("status %d: err = %v, want ambiguous and in progress", code, err)
+		if !errors.Is(err, ports.ErrGatewayAmbiguous) || !errors.Is(err, ports.ErrGatewayResendSameKey) {
+			t.Errorf("status %d: err = %v, want ambiguous and resend with the same key", code, err)
+		}
+	}
+}
+
+// net/http replays a request with an Idempotency-Key on a new connection
+// when a reused keep-alive connection fails after the request was written.
+// If the new connection cannot be dialed, Do returns a dial error although
+// the gateway received the request. The client must call that ambiguous and
+// resend with the same key later, not "not executed".
+func TestDialErrorAfterAWrittenRequestIsAmbiguous(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var posts atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		// A read on a fresh connection, answered with keep-alive.
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, req.Body)
+		body := `{"ref":"gw_1","status":"processing"}`
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+		// The create arrives on the reused connection. The gateway reads it,
+		// stops listening, and drops the connection without answering.
+		req, err = http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, req.Body)
+		if req.Method == http.MethodPost {
+			posts.Add(1)
+		}
+		_ = ln.Close()
+	}()
+	c, err := NewClient(Config{BaseURL: "http://" + ln.Addr().String(), CallTimeout: 2 * time.Second, MaxRetries: 2},
+		&http.Client{Transport: &http.Transport{}}, NewMetrics(prometheus.NewRegistry()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{}
+	c.wait = rec.wait
+	if _, err := c.Payment(context.Background(), "gw_1"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.CreatePayment(context.Background(), request())
+	<-done
+
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "dial" {
+		t.Fatalf("err = %v, want the transport's dial error this test is about", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("gateway received %d POSTs, want 1", posts.Load())
+	}
+	if !errors.Is(err, ports.ErrGatewayAmbiguous) || !errors.Is(err, ports.ErrGatewayResendSameKey) || errors.Is(err, ports.ErrGatewayUnavailable) {
+		t.Fatalf("err = %v, want ambiguous and resend with the same key, not unavailable", err)
+	}
+	if len(rec.waits) != 0 {
+		t.Fatalf("in-line resends = %v, want none: the task layer resends later", rec.waits)
+	}
+}
+
+// A 422 whose code says the key was reused with a different body is our
+// misconfiguration, not a decline; any other 422 is a decline.
+func TestKeyReused422IsNotADecline(t *testing.T) {
+	tests := []struct {
+		body         string
+		wantDeclined bool
+	}{
+		{body: `{"error":"idempotency key reused with a different request","code":"idempotency_key_reused"}`},
+		{body: `{"error":"card declined","code":"card_declined"}`, wantDeclined: true},
+		{body: `not json`, wantDeclined: true},
+	}
+	for _, tt := range tests {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = io.WriteString(w, tt.body)
+		}))
+		c, _ := newClient(t, srv.URL, Config{})
+		_, err := c.CreatePayment(context.Background(), request())
+		srv.Close()
+
+		declined := errors.Is(err, ports.ErrGatewayRejected)
+		if declined != tt.wantDeclined {
+			t.Errorf("body %s: err = %v, want declined %v", tt.body, err, tt.wantDeclined)
+		}
+		if !tt.wantDeclined && !errors.Is(err, ports.ErrGatewayMisconfigured) {
+			t.Errorf("body %s: err = %v, want misconfigured", tt.body, err)
+		}
+		if tt.wantDeclined && !strings.Contains(err.Error(), "declined") && !strings.Contains(err.Error(), "not json") {
+			t.Errorf("body %s: err = %v, want the gateway's message", tt.body, err)
 		}
 	}
 }

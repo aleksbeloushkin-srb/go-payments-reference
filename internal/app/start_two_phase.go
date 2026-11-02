@@ -25,8 +25,9 @@ import (
 //     the answer and closes the attempt.
 //
 // An ambiguous answer marks the attempt unknown and hands it to
-// reconciliation instead of guessing; an answer saying that the request is
-// still in progress keeps the attempt and its key for a later retry.
+// reconciliation instead of guessing; an answer that calls for the same
+// request again (409, 425, a connection lost after the request was written)
+// keeps the attempt and its key for a later retry.
 // Whatever crashes where, the stored attempt says what to check next. The
 // gateway must both deduplicate by idempotency key (a reused intent is sent
 // again) and support lookup by reference (ambiguous answers are settled by
@@ -51,9 +52,9 @@ func (s *Service) startTwoPhase(ctx context.Context, id uuid.UUID) error {
 		s.log.WarnContext(ctx, "gateway rejected payment", "payment", p, "err", err)
 		_, err := s.finishAttempt(ctx, attempt, payment.StatusFailed, "")
 		return err
-	case errors.Is(err, ports.ErrGatewayInProgress):
-		// The gateway knows this key and is still working on it: the attempt
-		// stays an intent and the task retries later with the same key.
+	case errors.Is(err, ports.ErrGatewayResendSameKey):
+		// The gateway may hold this request: the attempt stays an intent and
+		// the task resends it later with the same key, never a new one.
 		return fmt.Errorf("create payment at gateway: %w", err)
 	case errors.Is(err, ports.ErrGatewayAmbiguous):
 		return s.markUnknown(ctx, attempt, err)

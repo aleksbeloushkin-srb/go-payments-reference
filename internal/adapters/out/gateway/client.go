@@ -9,12 +9,27 @@
 //   - a dial error (connection refused, DNS failure): nothing was sent.
 //
 // Every other failure of a write is ambiguous: a timeout after the request
-// left, a reset connection, a 5xx, or a 409/425 saying that a request with
-// this key is still in progress may hide a payment that went through. The
-// client reports ports.ErrGatewayAmbiguous (with ports.ErrGatewayInProgress
-// for 409/425) and does not retry; the task layer decides what to do.
+// left, a reset connection or a 5xx may hide a payment that went through.
+// The client reports ports.ErrGatewayAmbiguous and does not retry; the task
+// layer decides what to do. Some ambiguous answers also carry
+// ports.ErrGatewayResendSameKey: the only safe next step is the same request
+// with the same key (409, 425, or a connection lost after the request was
+// written).
 //
-// Only an explicit decline (400, 402, 422) fails a payment. 401, 403, 404,
+// "Nothing was sent" is decided from what the transport actually did, not
+// from the error type. net/http replays a request that carries an
+// Idempotency-Key header on a new connection when a reused keep-alive
+// connection fails after the request was written; if that new connection
+// cannot be dialed, Do returns a dial error although the gateway already has
+// the request. An httptrace.ClientTrace records whether any attempt wrote
+// the request, and only a dial error with nothing written counts as "not
+// executed".
+//
+// Only an explicit decline (400, 402, 422) fails a payment, except a 422
+// whose error code says the key was reused with a different body: the body
+// for a key is a function of the payment's immutable fields, so that answer
+// means a bug or a key collision on our side, never the client's payment
+// being refused. It is treated as a misconfiguration: retried and alerted. 401, 403, 404,
 // 405 and unknown 4xx answers mean our credentials or URL are wrong: they
 // are reported as ports.ErrGatewayMisconfigured, counted in
 // gateway_requests_total with outcome "misconfigured" and retried, because a
@@ -36,9 +51,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -278,9 +295,20 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, ide
 		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 
+	var wrote, reused atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Reused {
+				reused.Store(true)
+			}
+		},
+		// Called after each write attempt, also a failed one: the bytes may
+		// have reached the gateway, so any call counts as written.
+		WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) },
+	}))
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return transportFailure(err, write)
+		return transportFailure(err, write, wrote.Load(), reused.Load())
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
@@ -292,7 +320,12 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, ide
 // classify maps an HTTP answer to a result. Writes and reads differ: a 5xx
 // on a write may hide an executed payment, on a read it is only a failure.
 func (c *Client) classify(resp *http.Response, write bool, path string, decode func(io.Reader) error) result {
-	switch code := resp.StatusCode; {
+	code := resp.StatusCode
+	var errBody []byte
+	if code >= 400 {
+		errBody, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	}
+	switch {
 	case code == http.StatusOK || code == http.StatusCreated:
 		if err := decode(io.LimitReader(resp.Body, maxResponseBytes)); err != nil {
 			return failed(unreadable(err, write))
@@ -310,14 +343,24 @@ func (c *Client) classify(resp *http.Response, write bool, path string, decode f
 		return failed(fmt.Errorf("%w: %s", ports.ErrGatewayNotFound, path))
 	case code == http.StatusRequestTimeout:
 		return failed(fmt.Errorf("%w: status %d", ports.ErrGatewayUnavailable, code))
+	case write && code == http.StatusUnprocessableEntity && errorCode(errBody) == codeKeyReused:
+		// The key was used before with a different body: our bug or a key
+		// collision, never a decline of this payment.
+		return failed(fmt.Errorf("%w: %w: status %d: idempotency key reused with a different request",
+			ports.ErrGatewayUnavailable, ports.ErrGatewayMisconfigured, code))
 	case write && (code == http.StatusBadRequest || code == http.StatusPaymentRequired || code == http.StatusUnprocessableEntity):
-		return failed(fmt.Errorf("%w: status %d: %s", ports.ErrGatewayRejected, code, snippet(resp.Body)))
-	case write && (code == http.StatusConflict || code == http.StatusTooEarly):
+		return failed(fmt.Errorf("%w: status %d: %s", ports.ErrGatewayRejected, code, snippet(errBody)))
+	case write && code == http.StatusConflict:
 		// A request with this idempotency key is still being processed.
-		return failed(fmt.Errorf("%w: %w: status %d", ports.ErrGatewayAmbiguous, ports.ErrGatewayInProgress, code))
+		return failed(fmt.Errorf("%w: %w: status %d", ports.ErrGatewayAmbiguous, ports.ErrGatewayResendSameKey, code))
+	case write && code == http.StatusTooEarly:
+		// 425 Too Early (RFC 8470): the gateway would not process the request
+		// yet, for example because it arrived in TLS early data, and expects
+		// it again. Sending it again with the same key is the safe retry.
+		return failed(fmt.Errorf("%w: %w: status %d", ports.ErrGatewayAmbiguous, ports.ErrGatewayResendSameKey, code))
 	case code >= 400 && code < 500:
 		return failed(fmt.Errorf("%w: %w: status %d: %s",
-			ports.ErrGatewayUnavailable, ports.ErrGatewayMisconfigured, code, snippet(resp.Body)))
+			ports.ErrGatewayUnavailable, ports.ErrGatewayMisconfigured, code, snippet(errBody)))
 	case write:
 		return failed(fmt.Errorf("%w: status %d", ports.ErrGatewayAmbiguous, code))
 	default:
@@ -325,17 +368,30 @@ func (c *Client) classify(resp *http.Response, write bool, path string, decode f
 	}
 }
 
-// transportFailure classifies an error from http.Client.Do.
-func transportFailure(err error, write bool) result {
+// transportFailure classifies an error from http.Client.Do. wrote reports
+// whether any attempt of the transport wrote the request, reused whether it
+// ran on a reused connection.
+func transportFailure(err error, write, wrote, reused bool) result {
 	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == "dial" {
-		// The connection was never established, so nothing was sent.
+	dial := errors.As(err, &opErr) && opErr.Op == "dial"
+	switch {
+	case dial && (!write || !wrote):
+		// Nothing was written, or it was a read: safe to send again now.
 		return result{err: fmt.Errorf("%w: %w", ports.ErrGatewayUnavailable, err), retry: true, wait: dialRetryDelay}
-	}
-	if write {
+	case !write:
+		return failed(fmt.Errorf("%w: %w", ports.ErrGatewayUnavailable, err))
+	case dial:
+		// The request was written on a connection that then failed, and the
+		// transport's replay could not connect: the gateway may have it.
+		conn := "a new connection"
+		if reused {
+			conn = "a reused connection"
+		}
+		return failed(fmt.Errorf("%w: %w: request written on %s, then the replay failed to connect: %w",
+			ports.ErrGatewayAmbiguous, ports.ErrGatewayResendSameKey, conn, err))
+	default:
 		return failed(fmt.Errorf("%w: %w", ports.ErrGatewayAmbiguous, err))
 	}
-	return failed(fmt.Errorf("%w: %w", ports.ErrGatewayUnavailable, err))
 }
 
 // unreadable classifies a 2xx response we could not understand. For a write
@@ -395,7 +451,22 @@ func retryAfter(v string, now time.Time) time.Duration {
 	return defaultRetryAfter
 }
 
-func snippet(r io.Reader) string {
-	b, _ := io.ReadAll(io.LimitReader(r, 200))
+// codeKeyReused is the gateway's error code for an idempotency key reused
+// with a different request body.
+const codeKeyReused = "idempotency_key_reused"
+
+// errorCode reads the machine-readable code of a gateway error body, or "".
+func errorCode(b []byte) string {
+	var body struct {
+		Code string `json:"code"`
+	}
+	_ = json.Unmarshal(b, &body)
+	return body.Code
+}
+
+func snippet(b []byte) string {
+	if len(b) > 200 {
+		b = b[:200]
+	}
 	return string(bytes.TrimSpace(b))
 }

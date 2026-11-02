@@ -35,11 +35,14 @@ var (
 	// (timeout after sending, 5xx, connection reset). Only a retry with the
 	// same idempotency key, or a lookup, can settle it.
 	ErrGatewayAmbiguous = errors.New("gateway outcome unknown")
-	// ErrGatewayInProgress means the gateway still processes a request with
-	// this idempotency key (409, 425). It always comes together with
-	// ErrGatewayAmbiguous. The key is proven to be known to the gateway, so
-	// the request is repeated later with the same key, never abandoned.
-	ErrGatewayInProgress = errors.New("gateway request with this key in progress")
+	// ErrGatewayResendSameKey means the outcome is unknown, but the only
+	// safe next step is to send the same request again with the same
+	// idempotency key: 409 (a request with this key is still being
+	// processed), 425 Too Early (the gateway declined to process the request
+	// yet and expects it again), or a connection error after the request was
+	// written. It always comes together with ErrGatewayAmbiguous. The key is
+	// never abandoned for it, because the gateway may hold the request.
+	ErrGatewayResendSameKey = errors.New("gateway outcome unknown; resend with the same key")
 	// ErrGatewayRejected means the gateway declined the payment for good: a
 	// validation or business refusal (400, 402, 422). The payment fails.
 	ErrGatewayRejected = errors.New("gateway declined the payment")

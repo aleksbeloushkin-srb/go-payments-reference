@@ -290,12 +290,12 @@ func TestAttemptChainIsCapped(t *testing.T) {
 	}
 }
 
-// 409/425: the gateway knows the key and is still working on it. The
-// attempt keeps its key and the task retries; nothing is abandoned.
-func TestInProgressKeepsTheKey(t *testing.T) {
+// 409, 425, or a connection lost after the request was written: the attempt
+// keeps its key and the task retries; nothing is abandoned.
+func TestResendSameKeyKeepsTheKey(t *testing.T) {
 	f := newFixture(testConfig)
 	p := f.seed(payment.StatusPending)
-	f.gateway.createErr = errors.Join(ports.ErrGatewayAmbiguous, ports.ErrGatewayInProgress)
+	f.gateway.createErr = errors.Join(ports.ErrGatewayAmbiguous, ports.ErrGatewayResendSameKey)
 
 	err := f.svc.StartPayment(context.Background(), p.ID)
 

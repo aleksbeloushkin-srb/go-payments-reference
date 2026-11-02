@@ -171,7 +171,7 @@ func (g *gateway) create(w http.ResponseWriter, r *http.Request) {
 
 	rec, created, err := g.store(key, in)
 	if err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error(), "code": "idempotency_key_reused"})
 		return
 	}
 	if created {

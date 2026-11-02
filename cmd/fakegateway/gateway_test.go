@@ -94,6 +94,20 @@ func TestCreateIsIdempotent(t *testing.T) {
 	if conflict.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("different body with the same key = %d, want 422", conflict.StatusCode)
 	}
+	// The error code tells a reused key apart from a declined payment.
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/payments",
+		strings.NewReader(`{"reference":"p-1","merchant_id":"m-1","amount_minor":1,"currency":"EUR"}`))
+	req.Header.Set("Idempotency-Key", "k1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct{ Code string }
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if body.Code != "idempotency_key_reused" {
+		t.Fatalf("error code = %q", body.Code)
+	}
 }
 
 func TestInjectedFaultsAreConsumedInOrder(t *testing.T) {
