@@ -130,7 +130,7 @@ precondition.
 | --- | --- |
 | `migrations/` | `00003_gateway_attempts.sql` |
 | `internal/ports` | `Attempts` port: open, reuse, close, mark unknown |
-| `internal/app/start.go` | split into tx1, call, tx2; new `reconcile` task handler |
+| `internal/app/start.go` | broken into tx1, call, tx2; new `reconcile` task handler |
 | `internal/adapters/out/gateway` | `FindByReference` when the gateway supports it |
 | `internal/adapters/out/postgres` | attempts repository |
 | `cmd/fakegateway` | fault "execute then drop the connection" (exists as "hang") and a lookup endpoint |

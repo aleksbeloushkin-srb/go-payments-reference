@@ -22,7 +22,7 @@ IMPROVEMENTS.md.
 - [x] Defaults live in one place, each with its reason (`platform.LoadConfig`).
 - [x] A zero duration is rejected: it would mean "already expired" or "no limit".
 - [x] Relations between settings are validated (write timeout vs soft timeout, task timeout vs lease, pool size vs worker concurrency, gateway budget vs task timeout).
-- [x] Configuration is read in `main` and passed down explicitly: no `init()`, no configuration or dependencies in globals, no `ctx.Value`. (Metrics counters are package-level `expvar` maps; see REVIEW.md, known limitations.)
+- [x] Configuration is read in `main` and passed down explicitly: no `init()`, no globals, no `ctx.Value`. Metrics are registered on a registry created in `main`, not on the global default.
 - [ ] Hot reload. Not needed here; when added, swap an immutable snapshot (`atomic.Pointer`) and use one snapshot per request or task.
 
 ## Lifecycle and shutdown
@@ -43,7 +43,7 @@ IMPROVEMENTS.md.
 - [x] Request bodies are size-limited with `http.MaxBytesReader` before decoding.
 - [x] Our own API rejects unknown JSON fields and trailing data; third-party webhooks are decoded leniently, so a new field from the gateway does not stop them.
 - [x] Readiness reflects shutdown; liveness checks only the process.
-- [ ] Admin endpoints on a separate port. `/debug/vars` is on the public port (REVIEW.md, W9).
+- [x] Admin endpoints on a separate port: `/metrics`, `/healthz` and `/readyz` on `PAYMENTS_ADMIN_ADDR`, in every role, stopped last.
 - [ ] Authentication and authorization of API callers. Out of scope for this reference (REVIEW.md, W10).
 - [~] Request ids: generated with `crypto/rand`; a well-formed incoming id is kept, which is only safe behind your own edge proxy.
 
@@ -78,14 +78,14 @@ IMPROVEMENTS.md.
 ## Queues and workers
 
 - [x] A task is marked done only after the handler succeeded; failures are retried with exponential backoff and jitter.
-- [x] A dead state with a log line at error level and a counter (`queue.dead` in `/debug/vars`).
+- [x] A dead state with a log line at error level, the `tasks_dead` gauge and the `DeadTasks` alert.
 - [x] The lease is longer than the task timeout (validated), and settling is fenced by the lease token.
 - [x] Concurrency is bounded and below the database pool size.
 - [x] On shutdown, running tasks finish instead of being cancelled mid-call.
 - [~] Handlers tolerate redelivery: they re-check the status under a row lock. A crash after the handler but before settling runs it again, which is safe for every handler here.
 - [x] Every payment that is not final has a poll task, whichever path made it non-final, so a lost webhook cannot leave it stuck.
 - [ ] Attempts counted at claim time. Today a process crash in the middle of a task does not count as an attempt (REVIEW.md, W2).
-- [ ] An alert on dead tasks and on the age of the oldest ready task. Metrics exist; alerting is the deployment's job.
+- [x] Alerts on dead tasks and on the age of the oldest due task (`DeadTasks`, `TaskBacklogStale`), with promtool tests. Routing them to people is the deployment's job.
 
 ## Outbox
 
@@ -99,7 +99,10 @@ IMPROVEMENTS.md.
 - [x] Structured JSON logs with a request id on every line written in a request.
 - [x] Logged entities use an allowlist of fields (`Payment.LogValue`); idempotency keys and request hashes stay out of logs.
 - [x] Access logs record the route pattern, never the query string or the body.
-- [~] Metrics: counters for tasks and the outbox in `expvar`. No latency histograms, no RED metrics per route (IMPROVEMENTS.md).
+- [x] RED metrics per route pattern, with long polls in their own histogram; queue, outbox, gateway, long-poll and pool metrics; business metrics counted only after commit (OBSERVABILITY.md).
+- [x] Labels have small fixed value sets: route patterns, folded methods, task kinds, outcomes. No ids; the e2e script fails if one appears.
+- [x] Counters that alerts depend on start at zero, so `increase()` sees the first event.
+- [x] A failing metrics query increments a counter and drops the gauges instead of reporting stale values.
 - [ ] Tracing with context propagated through tasks and events (IMPROVEMENTS.md).
 
 ## Security

@@ -49,7 +49,11 @@ adapter that implements the same two methods.
 6. **Choose the gateway per payment** if there are several: store the choice
    on the payment before the first call, so retries and polls go to the
    same gateway even if the routing rules change in between.
-7. **Tests.** Copy `internal/adapters/out/gateway/client_test.go`: an
+7. **Metrics.** Reuse the `gateway_requests_total{op,outcome}` vocabulary
+   for the new adapter, add a `gateway` label only if several gateways run
+   at once (it has a handful of values), and create the series at zero so
+   `GatewayMisconfigured` and `GatewayAmbiguousRatio` work from the start.
+8. **Tests.** Copy `internal/adapters/out/gateway/client_test.go`: an
    `httptest.Server` per failure class, and assertions on the number of
    calls, not only on the returned error. A retry policy is defined by how
    many requests it sends.
@@ -70,7 +74,8 @@ adapter that implements the same two methods.
    its first task and its event in one transaction.
 4. **Task kind.** Add `TaskStartRefund` to `internal/ports/task.go`, append
    it to `ports.TaskKinds`, and handle it in `Service.HandleTask`. The test
-   `TestHandleTaskKnowsEveryKind` fails if the kind has no handler.
+   `TestHandleTaskKnowsEveryKind` fails if the kind has no handler. The
+   queue metrics and gauges pick the new kind up from `ports.TaskKinds`.
 5. **Dedup keys.** Choose them so that a retried request cannot create a
    second task: `"start"` for once-per-entity work, the gateway's event id
    for webhooks.

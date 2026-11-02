@@ -20,6 +20,7 @@ the mistakes it is designed to avoid.
 | 8 | Two different "done" causes are kept apart: our own soft timeout is a normal answer, the client's cancellation is not. | `internal/app/query.go` (`WaitPayment`) |
 | 9 | Every goroutine has an owner and an exit path. | `internal/platform/lifecycle.go` (`Group`), `cmd/fakegateway/gateway.go` (`goBackground`, `close`) |
 | 10 | A zero timeout is never intended: configuration rejects it at start. | `internal/platform/config.go` (`validate`) |
+| 11 | Where an API gives no context, create one with a timeout instead of running unbounded. `prometheus.Collector.Collect` receives no context, so the queue collector bounds its query with its own 2 s timeout. | `internal/adapters/out/postgres/collector.go` (`Collect`) |
 
 ## Deadlines and budgets
 

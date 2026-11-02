@@ -15,10 +15,12 @@ flowchart LR
         batcher["Long-poll batcher<br/>longpoll"]
         worker["Task worker<br/>queue"]
         relay["Outbox relay<br/>outbox"]
+        admin["Admin listener<br/>metrics, probes"]
     end
     db[("PostgreSQL<br/>payments, tasks, outbox")]
     gw["Payment gateway<br/>cmd/fakegateway"]
     subs["Event subscribers<br/>log, optional webhook"]
+    prom["Prometheus<br/>alert rules"]
 
     client -->|"POST /v1/payments<br/>GET /wait"| api
     api --> db
@@ -28,11 +30,14 @@ flowchart LR
     gw -->|"signed webhook"| api
     relay --> db
     relay --> subs
+    prom -->|"scrape :9100/metrics"| admin
 ```
 
 One binary runs four roles. `PAYMENTS_ROLES` selects which of them start, so
 the same image can run as an API-only deployment, a worker-only deployment
-and so on. All roles share one PostgreSQL database, which is the only
+and so on. The admin listener (`PAYMENTS_ADMIN_ADDR`, Prometheus metrics,
+liveness and readiness) runs in every role; see
+[OBSERVABILITY.md](OBSERVABILITY.md). All roles share one PostgreSQL database, which is the only
 state: every instance is stateless apart from its in-memory long-poll
 registry.
 
@@ -75,6 +80,7 @@ port interfaces, and only `cmd/payments` knows every concrete type.
 | `internal/adapters/out/postgres` | payments store, task queue, outbox store, migrations runner | `domain/payment`, `ports`, `pkg/txctx` |
 | `internal/adapters/out/gateway` | HTTP client of the payment gateway with the retry policy | `domain/payment`, `ports` |
 | `internal/adapters/out/publisher` | log and webhook publishers for outbox events | `ports` |
+| `internal/adapters/out/metrics` | Prometheus implementation of the business metrics port | `domain/payment` |
 | `internal/longpoll` | waiter registry and batcher | `ports` |
 | `internal/platform` | configuration, logger, readiness, clock, background group | nothing |
 | `pkg/txctx` | transaction carried in `context.Context` | nothing |
@@ -337,6 +343,7 @@ sequenceDiagram
     H->>H: close waiter registry, drain requests
     M->>G: Stop: cancel and wait
     G->>G: running tasks finish, relay and batcher stop
+    M->>M: stop the admin listener (metrics, probes)
     M->>P: Close
     M->>OS: exit 0, or 1 if any step failed
 ```
@@ -350,7 +357,7 @@ sequenceDiagram
 | Done | `UPDATE ... SET state = 'done' WHERE id = $1 AND lease_until = $2` | `lease_until` is a fencing token: a worker whose lease expired cannot overwrite the new owner |
 | Retry | `attempts + 1`, `run_after = now + backoff` | exponential backoff with equal jitter |
 | Postpone | `run_after = now + delay`, attempts unchanged | polling: "not final yet" is not a failure |
-| Dead | `state = 'dead'` after `PAYMENTS_TASK_MAX_ATTEMPTS` or a permanent error | the dead-letter queue: logged at error level and counted in `/debug/vars` |
+| Dead | `state = 'dead'` after `PAYMENTS_TASK_MAX_ATTEMPTS` or a permanent error | the dead-letter queue: logged at error level, visible as `tasks_dead` and alerted on (`DeadTasks`) |
 
 Handlers report outcomes through error values from `ports`:
 `ports.RetryLater` to postpone, `ports.Permanent` to give up, anything else

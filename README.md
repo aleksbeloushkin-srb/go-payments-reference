@@ -71,8 +71,18 @@ The last two digits of the amount in minor units pick the outcome: `..99`
 is declined, `..98` needs a confirmation and then succeeds, `..97` needs a
 confirmation and is then canceled; anything else succeeds.
 
+Metrics and probes are on the admin port, and the stack includes
+Prometheus with the alert rules from `deploy/prometheus/`:
+
+```sh
+curl localhost:9100/metrics       # Prometheus metrics of the payments service
+curl localhost:9100/readyz        # readiness (503 while shutting down)
+open http://localhost:9091/alerts # Prometheus: alert rules and their state
+```
+
 `make e2e` starts the stack, runs all of this with curl and `jq`, checks
-the results, and tears the stack down.
+the results (including the metrics and a firing alert), and tears the stack
+down.
 
 ## Architecture
 
@@ -120,7 +130,10 @@ the data model and sequence diagrams for every flow are in
    per-instance registry; one batcher checks all awaited payments with one
    query per tick.
 7. **Shutdown.** Readiness off and no new tasks claimed, pause, HTTP drain,
-   background components, pool.
+   background components, admin listener, pool.
+8. **Observability.** Prometheus metrics, liveness and readiness are served
+   on a separate admin listener; alert rules live in `deploy/prometheus/`
+   ([docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)).
 
 ## How to read the code
 
@@ -162,6 +175,10 @@ the data model and sequence diagrams for every flow are in
 | Strict configuration with cross-checks | [`internal/platform/config.go`](internal/platform/config.go) |
 | Graceful shutdown and goroutine ownership | [`cmd/payments/main.go`](cmd/payments/main.go), [`internal/platform/lifecycle.go`](internal/platform/lifecycle.go) |
 | Fault injection | [`cmd/fakegateway/gateway.go`](cmd/fakegateway/gateway.go) |
+| RED metrics with low-cardinality labels; long polls in their own histogram | [`internal/adapters/in/httpapi/metrics.go`](internal/adapters/in/httpapi/metrics.go) |
+| Business metrics counted only after commit | [`internal/app/status.go`](internal/app/status.go) (`report`), [`internal/adapters/out/metrics/metrics.go`](internal/adapters/out/metrics/metrics.go) |
+| Gauges read from the database on scrape, no stale values on error | [`internal/adapters/out/postgres/collector.go`](internal/adapters/out/postgres/collector.go) |
+| Alert rules with unit tests | [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml), [`deploy/prometheus/alerts_test.yml`](deploy/prometheus/alerts_test.yml) |
 
 ## Tests
 
@@ -170,6 +187,7 @@ make test               # unit tests, -race, no Docker
 make test-integration   # adds PostgreSQL tests via testcontainers (needs Docker)
 make e2e                # whole stack with docker compose and curl
 make lint               # gofmt, go vet, staticcheck if installed
+make check-alerts       # promtool: Prometheus config and alert rule tests (needs Docker)
 ```
 
 Unit tests use in-memory fakes of the ports (with real rollback semantics),
@@ -228,6 +246,7 @@ reference service; each has its reason in
 | `PAYMENTS_WEBHOOK_SECRET` | required for the api role, 16+ bytes | gateway webhook HMAC key |
 | `PAYMENTS_ROLES` | `api,worker,relay` | components to run in this process |
 | `PAYMENTS_HTTP_ADDR` | `:8080` | listen address |
+| `PAYMENTS_ADMIN_ADDR` | `:9100` | admin listener: `/metrics`, `/healthz`, `/readyz`; must differ from the API address |
 | `PAYMENTS_HTTP_READ_HEADER_TIMEOUT` / `_READ_TIMEOUT` / `_WRITE_TIMEOUT` / `_IDLE_TIMEOUT` | `5s` / `10s` / `25s` / `60s` | server timeouts; write must exceed the wait timeout and two wait reads by 5s |
 | `PAYMENTS_SHUTDOWN_DRAIN_DELAY` / `_TIMEOUT` | `3s` / `15s` | pause after readiness turns off; HTTP drain limit |
 | `PAYMENTS_DB_MAX_CONNS` | `12` | pool size; must exceed worker concurrency by 3 |
@@ -253,12 +272,13 @@ The fake gateway reads `GATEWAY_ADDR`, `GATEWAY_WEBHOOK_URL`,
 | `github.com/jackc/pgx/v5` | v5.8.0 | PostgreSQL driver and pool; native types, no `database/sql` overhead |
 | `github.com/pressly/goose/v3` | v3.26.0 | SQL migrations embedded in the binary and applied at start under a lock |
 | `github.com/google/uuid` | v1.6.0 | UUIDv7 payment ids |
+| `github.com/prometheus/client_golang` | v1.23.2 | metrics on an injected registry, the exposition handler and collectors; the newest release that builds with Go 1.24 |
 | `golang.org/x/sync` | v0.19.0 | `errgroup` for the background components |
 | `github.com/google/go-cmp` | v0.7.0 | readable diffs in tests |
 | `github.com/testcontainers/testcontainers-go` | v0.40.0 | PostgreSQL for integration tests only |
 
 Everything else is the standard library: `net/http` with Go 1.22 routing,
-`log/slog`, `expvar`, `crypto/hmac`. The versions are the newest that still
+`log/slog`, `crypto/hmac`. The versions are the newest that still
 support Go 1.24, which is the minimum version of this module.
 
 ## Documents
@@ -269,6 +289,7 @@ support Go 1.24, which is the minimum version of this module.
 - [docs/CONTEXT.md](docs/CONTEXT.md): how `context.Context` is used and misused
 - [docs/EXTENDING.md](docs/EXTENDING.md): new gateway, new operation, new notification channel, scaling, versioning
 - [docs/CHECKLIST.md](docs/CHECKLIST.md): a production checklist, marked against this repository
+- [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md): every metric, every alert with its PromQL and runbook, and the cardinality rules
 
 ## License
 

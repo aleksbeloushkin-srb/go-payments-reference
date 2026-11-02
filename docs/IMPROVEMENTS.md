@@ -17,9 +17,9 @@ outcomes are handled, which several later items build on.
 | 5 | Retention and partitioning of `tasks` and `outbox` | W8 | bounded table and index size | medium | medium |
 | 6 | Relay: a failing event blocks only its own payment (the lease and publishing outside any transaction are already done) | W7 | one broken event no longer halts the whole outbox | low | low |
 | 7 | Ordering of non-final gateway statuses | W12 | no `processing` / `requires_action` flapping | low | low |
-| 8 | Metrics and tracing | W15 and operations | alerts on dead tasks, queue lag and pool waits; traces across tasks | low to medium | low |
+| 8 | Tracing (metrics and alert rules are done) | W15 | one trace per payment across the request, its tasks and gateway calls | low to medium | low |
 | 9 | Bulkhead and circuit breaker per gateway | after 1 | a failing gateway cannot take all workers | low | low |
-| 10 | API hardening: scoped, expiring idempotency keys; admin port; authentication | W9, W10, W17 | multi-tenant safety | medium | low |
+| 10 | API hardening: scoped, expiring idempotency keys; authentication (the admin port is done) | W10, W17 | multi-tenant safety | medium | low |
 | 11 | Dependency injection: stay manual, or adopt wire or fx | none | see the comparison below | low | low |
 
 ## 1. Gateway call outside the transaction, with a recorded intent
@@ -160,16 +160,26 @@ Effect: no flapping of the status shown to the client. Cost and risk low.
 
 ## 8. Metrics and tracing
 
-- Prometheus (or OpenTelemetry metrics) instead of `expvar`: request rate,
-  errors and latency per route pattern; task lag (claim time minus
-  `run_after`); attempts and outcomes per task kind; dead tasks; outbox lag;
-  `pgxpool.Stat` for acquire waits; long-poll waiters per instance.
-- OpenTelemetry tracing, with the trace context stored in the task payload
-  and the outbox row so that a poll that runs an hour later links back to
-  the request that created the payment (a span link, not one endless trace).
+**Metrics: done.** Prometheus metrics on an injected registry, served on
+the admin listener: request rate, errors and latency per route pattern;
+attempts, outcomes and lag per task kind; dead and ready tasks and the age
+of the oldest due task; outbox lag; gateway outcomes and latency; long-poll
+waiters; pool statistics. Alert rules with promtool tests live in
+`deploy/prometheus/`. [OBSERVABILITY.md](OBSERVABILITY.md) lists every
+metric, alert and cardinality rule.
 
-Effect: the alerts the checklist asks for. Cost low to medium. Risk low;
-watch label cardinality (never put ids in labels).
+**Tracing: planned.** OpenTelemetry tracing, with the trace context stored
+in the task payload and the outbox row, so that a poll that runs an hour
+later links back to the request that created the payment (a span link, not
+one endless trace). Spans for SQL statements and gateway calls, with
+exemplars on the latency histograms pointing at traces.
+
+Still open around metrics: an Alertmanager with routing, dashboards, and
+SLOs built on `http_requests_total` and `payment_time_to_final_seconds`.
+
+Effect of tracing: following one payment across processes without
+grepping logs by id. Cost low to medium. Risk low; sample by trace, never
+drop error traces.
 
 ## 9. Bulkhead and circuit breaker
 
@@ -182,8 +192,8 @@ using worker slots that other gateways need. Cost and risk low.
 - Scope idempotency keys per client and expire them (for example after 24
   hours), and store the original response so a replay returns exactly the
   same body.
-- Move `/debug/vars` and other admin endpoints to a separate listener that
-  is not exposed publicly.
+- Done: metrics and probes moved to a separate admin listener
+  (`PAYMENTS_ADMIN_ADDR`) that is not meant to be exposed publicly.
 - Authenticate API callers and check that a caller may see a payment
   (object-level authorization), and answer 404 rather than 403 for payments
   that belong to someone else, so ids cannot be probed.
