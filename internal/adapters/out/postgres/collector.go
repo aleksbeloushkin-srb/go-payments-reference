@@ -33,6 +33,8 @@ type QueueCollector struct {
 	dead              *prometheus.Desc
 	oldestReady       *prometheus.Desc
 	oldestUnpublished *prometheus.Desc
+	attempts          *prometheus.Desc
+	oldestOpenAttempt *prometheus.Desc
 	errors            prometheus.Counter
 }
 
@@ -51,6 +53,10 @@ func NewQueueCollector(db txctx.Querier, timeout time.Duration, log *slog.Logger
 			"Age of the oldest task that is due but not yet done; 0 when none.", nil, nil),
 		oldestUnpublished: prometheus.NewDesc("outbox_oldest_unpublished_seconds",
 			"Age of the oldest unpublished outbox event; 0 when none.", nil, nil),
+		attempts: prometheus.NewDesc("gateway_attempts",
+			"Gateway attempts of the two-phase start by state; done attempts are not counted.", []string{"state"}, nil),
+		oldestOpenAttempt: prometheus.NewDesc("gateway_attempt_oldest_open_seconds",
+			"Age of the oldest intent or unknown gateway attempt; 0 when none.", nil, nil),
 		errors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "metrics_collect_errors_total",
 			Help: "Scrapes in which the database gauges could not be read.",
@@ -64,11 +70,14 @@ func (c *QueueCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dead
 	ch <- c.oldestReady
 	ch <- c.oldestUnpublished
+	ch <- c.attempts
+	ch <- c.oldestOpenAttempt
 	c.errors.Describe(ch)
 }
 
 // queueStatsSQL returns one row per value: counts by kind for ready and dead
-// tasks, and the two ages.
+// tasks, counts by state for gateway attempts, and three ages. Done
+// attempts only ever grow, so they are left out of the per-scrape count.
 const queueStatsSQL = `
 	SELECT 'ready' AS name, kind, count(*)::float8 AS value
 	FROM tasks WHERE state = 'ready' GROUP BY kind
@@ -80,12 +89,18 @@ const queueStatsSQL = `
 	FROM tasks WHERE state = 'ready' AND run_after <= now()
 	UNION ALL
 	SELECT 'oldest_unpublished', '', greatest(coalesce(extract(epoch FROM now() - min(created_at))::float8, 0), 0)
-	FROM outbox WHERE published_at IS NULL`
+	FROM outbox WHERE published_at IS NULL
+	UNION ALL
+	SELECT 'attempts', state, count(*)::float8
+	FROM gateway_attempts WHERE state <> 'done' GROUP BY state
+	UNION ALL
+	SELECT 'oldest_open_attempt', '', greatest(coalesce(extract(epoch FROM now() - min(created_at))::float8, 0), 0)
+	FROM gateway_attempts WHERE state IN ('intent', 'unknown')`
 
 // queueStats is one scrape's worth of values.
 type queueStats struct {
-	ready, dead                    map[string]float64
-	oldestReady, oldestUnpublished float64
+	ready, dead, attempts                             map[string]float64
+	oldestReady, oldestUnpublished, oldestOpenAttempt float64
 }
 
 // Collect queries the database and sends the gauges. Prometheus gives
@@ -116,8 +131,17 @@ func (c *QueueCollector) Collect(ch chan<- prometheus.Metric) {
 	for kind, n := range stats.dead {
 		ch <- prometheus.MustNewConstMetric(c.dead, prometheus.GaugeValue, n, kind)
 	}
+	for _, state := range []ports.AttemptState{ports.AttemptIntent, ports.AttemptUnknown, ports.AttemptAbandoned} {
+		if _, ok := stats.attempts[string(state)]; !ok {
+			stats.attempts[string(state)] = 0
+		}
+	}
+	for state, n := range stats.attempts {
+		ch <- prometheus.MustNewConstMetric(c.attempts, prometheus.GaugeValue, n, state)
+	}
 	ch <- prometheus.MustNewConstMetric(c.oldestReady, prometheus.GaugeValue, stats.oldestReady)
 	ch <- prometheus.MustNewConstMetric(c.oldestUnpublished, prometheus.GaugeValue, stats.oldestUnpublished)
+	ch <- prometheus.MustNewConstMetric(c.oldestOpenAttempt, prometheus.GaugeValue, stats.oldestOpenAttempt)
 }
 
 func (c *QueueCollector) query(ctx context.Context) (queueStats, error) {
@@ -127,7 +151,7 @@ func (c *QueueCollector) query(ctx context.Context) (queueStats, error) {
 	}
 	defer rows.Close()
 
-	stats := queueStats{ready: map[string]float64{}, dead: map[string]float64{}}
+	stats := queueStats{ready: map[string]float64{}, dead: map[string]float64{}, attempts: map[string]float64{}}
 	for rows.Next() {
 		var (
 			name, kind string
@@ -145,6 +169,10 @@ func (c *QueueCollector) query(ctx context.Context) (queueStats, error) {
 			stats.oldestReady = value
 		case "oldest_unpublished":
 			stats.oldestUnpublished = value
+		case "attempts":
+			stats.attempts[kind] = value
+		case "oldest_open_attempt":
+			stats.oldestOpenAttempt = value
 		}
 	}
 	if err := rows.Err(); err != nil {

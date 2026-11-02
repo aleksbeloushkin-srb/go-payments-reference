@@ -47,6 +47,23 @@ tests:
 
   - interval: 1m
     input_series:
+      - series: 'gateway_attempt_oldest_open_seconds{instance="a:9100", job="payments"}'
+        values: '0 60 120 180 240 300 360 420 480 540 600 660 720'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: GatewayAttemptStuck
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: GatewayAttemptStuck
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "A gateway attempt has been open for more than five minutes"
+              runbook: "Check reconcile_total{outcome=\"error\"} and the gateway lookup; the payment waits in pending until the attempt is settled."
+
+  - interval: 1m
+    input_series:
       - series: 'http_requests_total{route="/v1/payments", method="POST", code="201", job="payments"}'
         values: '0+100x30'
       - series: 'http_requests_total{route="/v1/payments", method="POST", code="500", job="payments"}'

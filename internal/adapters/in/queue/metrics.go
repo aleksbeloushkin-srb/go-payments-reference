@@ -21,6 +21,7 @@ type Metrics struct {
 	claimed   *prometheus.CounterVec
 	attempts  *prometheus.CounterVec
 	lag       *prometheus.HistogramVec
+	duration  *prometheus.HistogramVec
 	leaseLost prometheus.Counter
 	panics    prometheus.Counter
 }
@@ -41,6 +42,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Time between a task becoming due (run_after) and its claim.",
 			Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300},
 		}, []string{"kind"}),
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "task_duration_seconds",
+			Help:    "Run time of a task handler, including waits for row locks and gateway calls.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}, []string{"kind"}),
 		leaseLost: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lease_lost_total",
 			Help: "Task results discarded because the lease had passed to another worker.",
@@ -50,7 +56,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help: "Task handler panics recovered by the worker.",
 		}),
 	}
-	reg.MustRegister(m.claimed, m.attempts, m.lag, m.leaseLost, m.panics)
+	reg.MustRegister(m.claimed, m.attempts, m.lag, m.duration, m.leaseLost, m.panics)
 	// Create the series of every known kind at zero, so increase() and
 	// rate() see the first event instead of starting from it.
 	for _, kind := range ports.TaskKinds {

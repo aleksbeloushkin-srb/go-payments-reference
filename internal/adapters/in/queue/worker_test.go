@@ -224,6 +224,13 @@ func TestWorkerObservesTaskLag(t *testing.T) {
 	if h := m.GetHistogram(); h.GetSampleCount() != 1 || h.GetSampleSum() != 5 {
 		t.Fatalf("lag histogram count=%d sum=%v, want one sample of 5s", h.GetSampleCount(), h.GetSampleSum())
 	}
+	var d dto.Metric
+	if err := w.metrics.duration.WithLabelValues("start_payment").(prometheus.Metric).Write(&d); err != nil {
+		t.Fatal(err)
+	}
+	if n := d.GetHistogram().GetSampleCount(); n != 1 {
+		t.Fatalf("task_duration_seconds samples = %d, want 1", n)
+	}
 }
 
 func TestWorkerRunsBatchConcurrently(t *testing.T) {

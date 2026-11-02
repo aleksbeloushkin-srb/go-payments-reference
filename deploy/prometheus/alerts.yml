@@ -34,6 +34,14 @@ groups:
 
   - name: payments-gateway
     rules:
+      - alert: GatewayAttemptStuck
+        expr: max(gateway_attempt_oldest_open_seconds) > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "A gateway attempt has been open for more than five minutes"
+          runbook: "Check reconcile_total{outcome=\"error\"} and the gateway lookup; the payment waits in pending until the attempt is settled."
       - alert: GatewayAmbiguousRatio
         expr: |
           sum by (op) (rate(gateway_requests_total{outcome="ambiguous"}[10m]))

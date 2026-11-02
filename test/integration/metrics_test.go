@@ -63,6 +63,11 @@ func TestQueueCollector(t *testing.T) {
 		('apply_gateway_event', gen_random_uuid(), 'evt_1', now(), 'dead')`)
 	exec(`INSERT INTO outbox (payment_id, type, payload, created_at) VALUES
 		(gen_random_uuid(), 'payment.created', '{}', now() - interval '90 seconds')`)
+	exec(`INSERT INTO payments (id, merchant_id, amount_minor, currency, status, version, idempotency_key, request_hash, created_at, updated_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 'm', 1, 'EUR', 'pending', 1, 'k', 'h', now(), now())`)
+	exec(`INSERT INTO gateway_attempts (payment_id, attempt, idempotency_key, state, created_at, updated_at) VALUES
+		('00000000-0000-0000-0000-000000000001', 1, 'k:1', 'abandoned', now() - interval '10 minutes', now()),
+		('00000000-0000-0000-0000-000000000001', 2, 'k:2', 'unknown', now() - interval '40 seconds', now())`)
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(postgres.NewQueueCollector(pool, 2*time.Second, discard()))
@@ -75,6 +80,9 @@ func TestQueueCollector(t *testing.T) {
 		"tasks_dead{kind=apply_gateway_event}":  1,
 		"tasks_dead{kind=start_payment}":        0,
 		"metrics_collect_errors_total":          0,
+		"gateway_attempts{state=unknown}":       1,
+		"gateway_attempts{state=abandoned}":     1,
+		"gateway_attempts{state=intent}":        0,
 	} {
 		if got[key] != want {
 			t.Errorf("%s = %v, want %v", key, got[key], want)
@@ -85,6 +93,9 @@ func TestQueueCollector(t *testing.T) {
 	}
 	if age := got["outbox_oldest_unpublished_seconds"]; age < 90 || age > 120 {
 		t.Errorf("outbox_oldest_unpublished_seconds = %v, want about 90", age)
+	}
+	if age := got["gateway_attempt_oldest_open_seconds"]; age < 40 || age > 70 {
+		t.Errorf("gateway_attempt_oldest_open_seconds = %v, want about 40 (the abandoned attempt does not count)", age)
 	}
 }
 

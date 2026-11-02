@@ -156,7 +156,9 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 func (w *Worker) process(ctx context.Context, t ports.Task) {
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.cfg.TaskTimeout)
 	defer cancel()
+	start := time.Now()
 	err := w.handle(hctx, t)
+	w.metrics.duration.WithLabelValues(string(t.Kind)).Observe(time.Since(start).Seconds())
 	w.settle(ctx, t, err)
 }
 
