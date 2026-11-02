@@ -1,0 +1,35 @@
+GO      ?= go
+PKGS    := ./...
+
+.PHONY: run test test-integration e2e lint compose-up compose-down
+
+## run: build and start the whole stack in the foreground (Ctrl-C stops it)
+run:
+	docker compose up --build
+
+## test: unit tests with the race detector (no Docker needed)
+test:
+	$(GO) test -race -count=1 $(PKGS)
+
+## test-integration: integration tests against PostgreSQL in Docker
+test-integration:
+	$(GO) test -race -count=1 -tags integration $(PKGS)
+
+## e2e: start the stack, drive it with curl, tear it down
+e2e:
+	./scripts/e2e.sh
+
+## lint: formatting, vet and staticcheck (if installed)
+lint:
+	@test -z "$$(gofmt -s -l .)" || { gofmt -s -l .; echo "run gofmt -s -w ."; exit 1; }
+	$(GO) vet $(PKGS)
+	$(GO) vet -tags integration $(PKGS)
+	@if command -v staticcheck >/dev/null; then staticcheck -checks all $(PKGS); else echo "staticcheck not installed, skipped"; fi
+
+## compose-up: start the stack in the background and wait until healthy
+compose-up:
+	docker compose up --build -d --wait
+
+## compose-down: stop the stack and delete its volumes
+compose-down:
+	docker compose down -v

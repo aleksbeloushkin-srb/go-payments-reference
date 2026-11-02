@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pinkponies Bank · payments demo</title>
+  <link rel="icon" href="/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <img src="/logo.svg" alt="Pinkponies Bank" class="logo" width="340" height="96">
+    <p class="tagline">
+      <span aria-hidden="true">🦄</span>
+      Pinkponies Bank is a fictional bank used to keep the example concrete.
+      Every payment below goes through the real service: idempotent create, background worker,
+      fake payment gateway and long polling.
+    </p>
+  </header>
+
+  <main>
+    <section class="card" aria-labelledby="pay-title">
+      <h2 id="pay-title">Pay a merchant</h2>
+      <form id="pay-form" novalidate>
+        <label>Merchant
+          <input name="merchant" value="hay-and-oats-store" required maxlength="64" autocomplete="off">
+        </label>
+        <div class="row">
+          <label>Amount
+            <input name="amount" value="12.50" inputmode="decimal" required autocomplete="off">
+          </label>
+          <label>Currency
+            <select name="currency">
+              <option>EUR</option><option>USD</option><option>GBP</option><option>CHF</option><option>JPY</option>
+            </select>
+          </label>
+        </div>
+        <button type="submit">Send payment</button>
+        <p class="hint">
+          Fake gateway rules by the last two digits of the amount in minor units:
+          <strong>…99</strong> is declined, <strong>…98</strong> asks for a confirmation and then succeeds,
+          <strong>…97</strong> asks for a confirmation and is then canceled.
+        </p>
+        <p id="form-error" class="note" role="alert"></p>
+      </form>
+    </section>
+
+    <section aria-labelledby="list-title">
+      <h2 id="list-title">Payments in this browser tab</h2>
+      <ol id="payments" class="payments"></ol>
+    </section>
+  </main>
+
+  <footer>
+    Status updates arrive through <code>GET /v1/payments/{id}/wait?version=N</code>.
+    Counters: <a href="/debug/vars">/debug/vars</a>.
+  </footer>
+
+  <template id="payment-template">
+    <li class="card payment">
+      <div class="payment-head">
+        <span class="amount"></span>
+        <span class="chip" data-role="chip"></span>
+      </div>
+      <div class="meta"></div>
+      <p class="mood" aria-live="polite"></p>
+      <ol class="timeline" aria-label="Status history"></ol>
+      <div class="actions">
+        <button type="button" class="secondary" data-action="replay">Replay same request</button>
+        <button type="button" class="secondary" data-action="conflict">Reuse key, other amount</button>
+      </div>
+      <p class="note" aria-live="polite"></p>
+    </li>
+  </template>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

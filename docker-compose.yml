@@ -1,0 +1,53 @@
+# Local stack: PostgreSQL, the payments service and the fake gateway.
+#   docker compose up --build      then open http://localhost:8080
+# The secrets below are development values; never reuse them anywhere else.
+
+# Both services run binaries from the same image. If image builds stall on
+# a VM-based Docker, see "Troubleshooting" in the README.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  fakegateway:
+    build: .
+    image: go-payments-reference:dev
+    entrypoint: ["/fakegateway"]
+    environment:
+      GATEWAY_ADDR: ":9090"
+      GATEWAY_WEBHOOK_URL: http://payments:8080/v1/gateway/events
+      GATEWAY_WEBHOOK_SECRET: dev-only-webhook-secret
+      GATEWAY_SETTLE_DELAY: 1500ms
+    ports:
+      - "9090:9090"
+
+  payments:
+    build: .
+    image: go-payments-reference:dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      fakegateway:
+        condition: service_started
+    environment:
+      PAYMENTS_DATABASE_URL: postgres://payments:payments@postgres:5432/payments?sslmode=disable
+      PAYMENTS_GATEWAY_URL: http://fakegateway:9090
+      PAYMENTS_WEBHOOK_SECRET: dev-only-webhook-secret
+      PAYMENTS_ROLES: api,worker,relay
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/payments", "healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # Drain delay + HTTP shutdown + the longest running task must fit.
+    stop_grace_period: 60s

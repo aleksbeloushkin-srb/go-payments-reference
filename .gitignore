@@ -1,0 +1,10 @@
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+.DS_Store
+.idea/
+.vscode/
+# Local, machine-specific Compose settings (see README, Troubleshooting).
+compose.override.yaml

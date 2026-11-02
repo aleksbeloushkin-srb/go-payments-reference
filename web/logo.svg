@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 96" width="340" height="96" role="img" aria-labelledby="logo-title">
+  <title id="logo-title">Pinkponies Bank</title>
+  <!-- Badge -->
+  <circle cx="48" cy="48" r="44" fill="#F472B6"/>
+  <circle cx="48" cy="48" r="44" fill="none" stroke="#9D174D" stroke-width="3"/>
+  <!-- Pony head, facing right -->
+  <path fill="#FFF7FB" d="M30 84 C27 66 29 48 37 36 L35 18 L46 28 C56 26 66 30 72 39 C76 45 80 53 78 59 C76 65 68 66 62 62 C56 60 52 64 52 72 L54 84 Z"/>
+  <!-- Mane -->
+  <path fill="#9D174D" d="M37 36 C29 41 25 50 28 58 C23 64 24 75 30 84 L35 84 C32 74 33 64 37 56 C35 49 38 42 42 39 Z"/>
+  <!-- Eye and nostril -->
+  <circle cx="57" cy="42" r="3" fill="#9D174D"/>
+  <circle cx="73" cy="56" r="1.8" fill="#9D174D"/>
+  <!-- Star -->
+  <polygon fill="#FFF7FB" stroke="#9D174D" stroke-width="1.2" stroke-linejoin="round"
+    points="76,11 77.8,17.6 84.7,17.8 79.3,21.9 81.3,28.5 76,24.6 70.7,28.5 72.7,21.9 67.3,17.8 74.2,17.6"/>
+  <!-- Wordmark -->
+  <text x="106" y="50" fill="#9D174D" font-family="ui-rounded, 'Trebuchet MS', system-ui, sans-serif" font-size="34" font-weight="700" letter-spacing="0.5">Pinkponies</text>
+  <text x="108" y="78" fill="#9D174D" font-family="ui-rounded, 'Trebuchet MS', system-ui, sans-serif" font-size="20" font-weight="400" letter-spacing="6">BANK</text>
+</svg>
