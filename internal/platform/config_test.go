@@ -26,7 +26,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.HTTPWriteTimeout <= cfg.WaitTimeout {
 		t.Fatal("default write timeout must exceed the long-poll soft timeout")
 	}
-	if cfg.WaitTimeout != 15*time.Second || cfg.TaskLease != time.Minute || cfg.AdminAddr != ":9100" {
+	if cfg.WaitTimeout != 15*time.Second || cfg.TaskLease != time.Minute || cfg.AdminAddr != ":9100" || cfg.StartMode != "two_phase" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
@@ -51,6 +51,8 @@ func TestLoadConfigErrors(t *testing.T) {
 		{"short secret", []string{"PAYMENTS_WEBHOOK_SECRET=short"}, "WEBHOOK_SECRET must be at least 16"},
 		{"bad gateway url", []string{"PAYMENTS_GATEWAY_URL=localhost:9090"}, "GATEWAY_URL must be an http(s) URL"},
 		{"admin on the api port", []string{"PAYMENTS_ADMIN_ADDR=:8080"}, "ADMIN_ADDR must differ from HTTP_ADDR"},
+		{"unknown start mode", []string{"PAYMENTS_START_MODE=eventually"}, `"eventually" is not one of [two_phase in_tx]`},
+		{"no reconcile lookups", []string{"PAYMENTS_RECONCILE_NOT_FOUND_LIMIT=0"}, "RECONCILE_NOT_FOUND_LIMIT must be at least 1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

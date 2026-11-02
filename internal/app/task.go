@@ -18,6 +18,8 @@ func (s *Service) HandleTask(ctx context.Context, t ports.Task) error {
 		return s.PollPayment(ctx, t.PaymentID)
 	case ports.TaskApplyGatewayEvent:
 		return s.ApplyGatewayEvent(ctx, t.Payload)
+	case ports.TaskReconcilePayment:
+		return s.ReconcilePayment(ctx, t.PaymentID, t.Payload)
 	default:
 		return ports.Permanent(fmt.Errorf("unknown task kind %q", t.Kind))
 	}

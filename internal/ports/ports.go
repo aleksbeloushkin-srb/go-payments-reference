@@ -71,6 +71,9 @@ type Metrics interface {
 	// StatusChanged reports a committed status change; age is the time since
 	// the payment was created.
 	StatusChanged(from, to payment.Status, age time.Duration)
+	// Reconciled reports how one reconciliation of an ambiguous gateway
+	// attempt ended: found, not_found, abandoned, duplicate or error.
+	Reconciled(outcome string)
 }
 
 // Watcher lets a use case wait until a payment's version moves past a marker

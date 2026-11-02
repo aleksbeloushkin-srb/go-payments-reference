@@ -104,11 +104,12 @@ func newEnv(t *testing.T, cfg app.Config) *env {
 		clock:    &clock{now: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)},
 	}
 	if cfg == (app.Config{}) {
-		cfg = app.Config{PollInterval: 3 * time.Second, PollTimeout: time.Hour, WaitTimeout: 5 * time.Second, WaitReadTimeout: 2 * time.Second}
+		cfg = defaultConfig()
 	}
 	e.svc = app.NewService(app.Deps{
 		Tx:       tx,
 		Payments: e.payments,
+		Attempts: e.attempts,
 		Tasks:    e.tasks,
 		Events:   e.outbox,
 		Gateway:  e.gateway,
@@ -119,6 +120,19 @@ func newEnv(t *testing.T, cfg app.Config) *env {
 		Logger:   discard(),
 	}, cfg)
 	return e
+}
+
+// defaultConfig is the service configuration of most tests: the v2 start.
+func defaultConfig() app.Config {
+	return app.Config{
+		StartMode:              app.StartTwoPhase,
+		ReconcileInterval:      5 * time.Second,
+		ReconcileNotFoundLimit: 3,
+		PollInterval:           3 * time.Second,
+		PollTimeout:            time.Hour,
+		WaitTimeout:            5 * time.Second,
+		WaitReadTimeout:        2 * time.Second,
+	}
 }
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

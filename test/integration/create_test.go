@@ -78,8 +78,11 @@ func TestConcurrentCreatesWithOneKey(t *testing.T) {
 
 // The status change, its outbox event and the follow-up task commit
 // together. When the gateway outcome is ambiguous, none of them is written.
+// This is the v1 start, whose single transaction rolls everything back.
 func TestOutboxIsWrittenInTheSameTransaction(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	cfg := defaultConfig()
+	cfg.StartMode = app.StartInTx
+	e := newEnv(t, cfg)
 	p := createPayment(t, e, "key-1", 1500).Payment
 
 	e.gateway.set(ports.GatewayPayment{}, ports.ErrGatewayAmbiguous)

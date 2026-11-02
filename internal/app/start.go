@@ -11,7 +11,17 @@ import (
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
 
-// StartPayment sends a pending payment to the gateway.
+// StartPayment sends a pending payment to the gateway, in the configured
+// start mode.
+func (s *Service) StartPayment(ctx context.Context, id uuid.UUID) error {
+	if s.cfg.StartMode == StartInTx {
+		return s.startInTx(ctx, id)
+	}
+	return s.startTwoPhase(ctx, id)
+}
+
+// startInTx is the version 1 start, kept for comparison
+// (PAYMENTS_START_MODE=in_tx).
 //
 // Version 1 uses this design on purpose, as a teaching example of the
 // trade-off: the gateway call happens inside the database transaction,
@@ -20,10 +30,10 @@ import (
 // lock for the whole network round trip, and a crash between the gateway's
 // success and our commit leaves an outcome only the gateway knows. The
 // retry stays correct only because the gateway deduplicates by idempotency
-// key. docs/REVIEW.md explains the costs and docs/IMPROVEMENTS.md the v2
-// shape (record the intent, call outside the transaction, apply the result
-// in a second transaction).
-func (s *Service) StartPayment(ctx context.Context, id uuid.UUID) error {
+// key. docs/REVIEW.md explains the costs; startTwoPhase is the v2 shape
+// (record the intent, call outside the transaction, apply the result in a
+// second transaction).
+func (s *Service) startInTx(ctx context.Context, id uuid.UUID) error {
 	var change *statusChange
 	err := s.tx.Run(ctx, func(ctx context.Context) error {
 		p, err := s.payments.Lock(ctx, id)

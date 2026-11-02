@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"maps"
@@ -21,33 +22,133 @@ import (
 type memStore struct {
 	mu       sync.Mutex
 	payments map[uuid.UUID]payment.Payment
+	attempts map[attemptID]ports.Attempt
 	tasks    []ports.TaskSpec
 	events   []payment.Event
 	reads    int
 	readDone chan struct{} // receives a value after every read when set
+
+	// runs counts transactions; the one numbered crashOnRun crashes just
+	// before its commit, like a process killed at that point.
+	runs       int
+	crashOnRun int
 }
 
+type attemptID struct {
+	payment uuid.UUID
+	number  int
+}
+
+// errCrash is the panic value of a simulated process crash.
+var errCrash = errors.New("simulated crash")
+
 func newMemStore() *memStore {
-	return &memStore{payments: map[uuid.UUID]payment.Payment{}}
+	return &memStore{payments: map[uuid.UUID]payment.Payment{}, attempts: map[attemptID]ports.Attempt{}}
 }
 
 type memState struct {
 	payments map[uuid.UUID]payment.Payment
+	attempts map[attemptID]ports.Attempt
 	tasks    []ports.TaskSpec
 	events   []payment.Event
 }
 
-func (s *memStore) Run(ctx context.Context, fn func(ctx context.Context) error) error {
+func (s *memStore) snapshot() memState {
 	s.mu.Lock()
-	snap := memState{maps.Clone(s.payments), slices.Clone(s.tasks), slices.Clone(s.events)}
+	defer s.mu.Unlock()
+	return memState{maps.Clone(s.payments), maps.Clone(s.attempts), slices.Clone(s.tasks), slices.Clone(s.events)}
+}
+
+func (s *memStore) restore(st memState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.payments, s.attempts, s.tasks, s.events = st.payments, st.attempts, st.tasks, st.events
+}
+
+func (s *memStore) Run(ctx context.Context, fn func(ctx context.Context) error) error {
+	snap := s.snapshot()
+	s.mu.Lock()
+	s.runs++
+	crash := s.runs == s.crashOnRun
 	s.mu.Unlock()
 	if err := fn(ctx); err != nil {
-		s.mu.Lock()
-		s.payments, s.tasks, s.events = snap.payments, snap.tasks, snap.events
-		s.mu.Unlock()
+		s.restore(snap)
 		return err
 	}
+	if crash {
+		s.restore(snap) // the commit never happened
+		panic(errCrash)
+	}
 	return nil
+}
+
+// memAttempts is the ports.Attempts view of a memStore.
+type memAttempts struct{ s *memStore }
+
+func (m memAttempts) Open(_ context.Context, id uuid.UUID) (ports.Attempt, bool, error) {
+	m.s.mu.Lock()
+	defer m.s.mu.Unlock()
+	for k, a := range m.s.attempts {
+		if k.payment == id && a.State.Open() {
+			return a, true, nil
+		}
+	}
+	return ports.Attempt{}, false, nil
+}
+
+func (m memAttempts) Get(_ context.Context, id uuid.UUID, n int) (ports.Attempt, error) {
+	m.s.mu.Lock()
+	defer m.s.mu.Unlock()
+	a, ok := m.s.attempts[attemptID{id, n}]
+	if !ok {
+		return ports.Attempt{}, ports.ErrAttemptNotFound
+	}
+	return a, nil
+}
+
+func (m memAttempts) Create(_ context.Context, id uuid.UUID, now time.Time) (ports.Attempt, error) {
+	m.s.mu.Lock()
+	defer m.s.mu.Unlock()
+	n := 1
+	for k, a := range m.s.attempts {
+		if k.payment != id {
+			continue
+		}
+		if a.State.Open() {
+			return ports.Attempt{}, errors.New("a second open attempt")
+		}
+		n = max(n, k.number+1)
+	}
+	a := ports.Attempt{PaymentID: id, Number: n, IdempotencyKey: ports.AttemptKey(id, n),
+		State: ports.AttemptIntent, CreatedAt: now, UpdatedAt: now}
+	m.s.attempts[attemptID{id, n}] = a
+	return a, nil
+}
+
+func (m memAttempts) Update(_ context.Context, a ports.Attempt, from ports.AttemptState) error {
+	m.s.mu.Lock()
+	defer m.s.mu.Unlock()
+	k := attemptID{a.PaymentID, a.Number}
+	cur, ok := m.s.attempts[k]
+	if !ok || cur.State != from {
+		return ports.ErrAttemptChanged
+	}
+	m.s.attempts[k] = a
+	return nil
+}
+
+// attemptStates lists the payment's attempts' states in attempt order.
+func (s *memStore) attemptStates(id uuid.UUID) []ports.AttemptState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []ports.AttemptState
+	for n := 1; ; n++ {
+		a, ok := s.attempts[attemptID{id, n}]
+		if !ok {
+			return out
+		}
+		out = append(out, a.State)
+	}
 }
 
 func (s *memStore) Insert(_ context.Context, p payment.Payment) (payment.Payment, bool, error) {
@@ -191,9 +292,10 @@ func (w *fakeWatcher) Watch(uuid.UUID, int64) (<-chan int64, func(), error) {
 
 // fakeMetrics records what the use cases report.
 type fakeMetrics struct {
-	mu      sync.Mutex
-	created int
-	changes []string
+	mu         sync.Mutex
+	created    int
+	changes    []string
+	reconciled []string
 }
 
 func (m *fakeMetrics) PaymentCreated() {
@@ -206,6 +308,12 @@ func (m *fakeMetrics) StatusChanged(from, to payment.Status, _ time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.changes = append(m.changes, string(from)+"->"+string(to))
+}
+
+func (m *fakeMetrics) Reconciled(outcome string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reconciled = append(m.reconciled, outcome)
 }
 
 type fixedClock struct{ now time.Time }
@@ -222,10 +330,13 @@ type fixture struct {
 }
 
 var testConfig = Config{
-	PollInterval:    3 * time.Second,
-	PollTimeout:     time.Hour,
-	WaitTimeout:     time.Minute,
-	WaitReadTimeout: time.Second,
+	StartMode:              StartTwoPhase,
+	ReconcileInterval:      5 * time.Second,
+	ReconcileNotFoundLimit: 3,
+	PollInterval:           3 * time.Second,
+	PollTimeout:            time.Hour,
+	WaitTimeout:            time.Minute,
+	WaitReadTimeout:        time.Second,
 }
 
 func newFixture(cfg Config) *fixture {
@@ -239,6 +350,7 @@ func newFixture(cfg Config) *fixture {
 	f.svc = NewService(Deps{
 		Tx:       f.store,
 		Payments: f.store,
+		Attempts: memAttempts{f.store},
 		Tasks:    f.store,
 		Events:   f.store,
 		Gateway:  f.gateway,
@@ -262,4 +374,11 @@ func (f *fixture) seed(status payment.Status) payment.Payment {
 	}
 	f.store.payments[p.ID] = p
 	return p
+}
+
+// v1Config runs the version 1 start (gateway call inside the transaction).
+func v1Config() Config {
+	cfg := testConfig
+	cfg.StartMode = StartInTx
+	return cfg
 }

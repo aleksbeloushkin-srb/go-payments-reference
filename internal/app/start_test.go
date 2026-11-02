@@ -10,6 +10,7 @@ import (
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
 
+// TestStartPayment covers the version 1 start (in_tx).
 func TestStartPayment(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -54,7 +55,7 @@ func TestStartPayment(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFixture(testConfig)
+			f := newFixture(v1Config())
 			p := f.seed(payment.StatusPending)
 			f.gateway.createResp, f.gateway.createErr = tt.resp, tt.err
 
@@ -107,12 +108,13 @@ func TestStartPaymentUnknownIDIsPermanent(t *testing.T) {
 	}
 }
 
-// The sequence from the review: the first start is ambiguous and rolls back,
-// a non-final gateway event arrives before the retry, and the retry finds
-// the payment already started. A poll task must exist throughout, or a lost
-// final webhook would leave the payment "processing" forever.
+// The sequence from the review, in the version 1 start: the first start is
+// ambiguous and rolls back, a non-final gateway event arrives before the
+// retry, and the retry finds the payment already started. A poll task must
+// exist throughout, or a lost final webhook would leave the payment
+// "processing" forever.
 func TestNonFinalEventBeforeStartCommitStillPolls(t *testing.T) {
-	f := newFixture(testConfig)
+	f := newFixture(v1Config())
 	p := f.seed(payment.StatusPending)
 	f.gateway.createErr = ports.ErrGatewayAmbiguous
 	if err := f.svc.StartPayment(context.Background(), p.ID); err == nil {

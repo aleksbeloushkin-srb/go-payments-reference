@@ -121,6 +121,7 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 	clock := platform.SystemClock{}
 	tx := txctx.New(pool)
 	payments := postgres.NewPayments(tx)
+	attempts := postgres.NewAttempts(tx)
 	tasks := postgres.NewTasks(tx)
 	events := postgres.NewOutbox(tx)
 	gw, err := newGateway(cfg, gateway.NewMetrics(reg))
@@ -134,6 +135,7 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 	svc := app.NewService(app.Deps{
 		Tx:       tx,
 		Payments: payments,
+		Attempts: attempts,
 		Tasks:    tasks,
 		Events:   events,
 		Gateway:  gw,
@@ -143,10 +145,13 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 		NewID:    uuid.NewV7,
 		Logger:   log,
 	}, app.Config{
-		PollInterval:    cfg.PollInterval,
-		PollTimeout:     cfg.PollTimeout,
-		WaitTimeout:     cfg.WaitTimeout,
-		WaitReadTimeout: cfg.WaitReadTimeout,
+		StartMode:              app.StartMode(cfg.StartMode),
+		ReconcileInterval:      cfg.ReconcileInterval,
+		ReconcileNotFoundLimit: cfg.ReconcileNotFoundLimit,
+		PollInterval:           cfg.PollInterval,
+		PollTimeout:            cfg.PollTimeout,
+		WaitTimeout:            cfg.WaitTimeout,
+		WaitReadTimeout:        cfg.WaitReadTimeout,
 	})
 
 	// Background components. Their context is independent of the signal
@@ -216,7 +221,8 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 		}
 	}
 	ready.Set(true)
-	log.Info("payments started", "roles", cfg.Roles, "addr", cfg.HTTPAddr, "admin_addr", cfg.AdminAddr)
+	log.Info("payments started", "roles", cfg.Roles, "addr", cfg.HTTPAddr, "admin_addr", cfg.AdminAddr,
+		"start_mode", cfg.StartMode)
 
 	var apiDone <-chan struct{} // nil without the api role: never ready
 	if api != nil {

@@ -14,7 +14,7 @@ import (
 // Business metrics count only committed work: a replay creates nothing, and
 // a start that rolls back changes no status.
 func TestMetricsCountOnlyCommittedWork(t *testing.T) {
-	f := newFixture(testConfig)
+	f := newFixture(v1Config())
 	ctx := context.Background()
 
 	res, err := f.svc.CreatePayment(ctx, validRequest())

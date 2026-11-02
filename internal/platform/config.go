@@ -65,6 +65,10 @@ type Config struct {
 	PollInterval time.Duration
 	PollTimeout  time.Duration
 
+	StartMode              string
+	ReconcileInterval      time.Duration
+	ReconcileNotFoundLimit int
+
 	WaitTimeout       time.Duration
 	WaitReadTimeout   time.Duration
 	WaitMaxWaiters    int
@@ -145,6 +149,15 @@ func LoadConfig(environ []string) (Config, error) {
 		// After this a non-final payment needs a human, not more polls.
 		PollTimeout: l.duration("POLL_TIMEOUT", 2*time.Hour),
 
+		// two_phase calls the gateway with no transaction open (v2); in_tx
+		// is the v1 start, kept to compare the two.
+		StartMode: l.oneOf("START_MODE", "two_phase", "two_phase", "in_tx"),
+		// Lookups of an ambiguous attempt, spaced so a gateway that is slow
+		// to show a new payment gets 10 to 15 s before the attempt is
+		// abandoned after three certain "not found" answers.
+		ReconcileInterval:      l.duration("RECONCILE_INTERVAL", 5*time.Second),
+		ReconcileNotFoundLimit: l.integer("RECONCILE_NOT_FOUND_LIMIT", 3),
+
 		// Well under the 30 to 60 second idle timeouts common in proxies.
 		WaitTimeout: l.duration("WAIT_TIMEOUT", 15*time.Second),
 		// Each of the two reads of a long poll, and the batch query; short
@@ -194,6 +207,7 @@ func (c Config) validate() error {
 		"POLL_INTERVAL": c.PollInterval, "POLL_TIMEOUT": c.PollTimeout, "WAIT_TIMEOUT": c.WaitTimeout, "WAIT_READ_TIMEOUT": c.WaitReadTimeout,
 		"WAIT_BATCH_INTERVAL": c.WaitBatchInterval, "RELAY_INTERVAL": c.RelayInterval,
 		"RELAY_LEASE": c.RelayLease, "EVENTS_WEBHOOK_TIMEOUT": c.EventsWebhookTimeout,
+		"RECONCILE_INTERVAL": c.ReconcileInterval,
 	}
 	for _, name := range slices.Sorted(maps.Keys(durations)) {
 		// A zero timeout would mean "already expired" or "no limit"; neither
@@ -207,6 +221,7 @@ func (c Config) validate() error {
 	check(c.GatewayMaxRetries >= 0 && c.GatewayMaxRetries <= 10, "%sGATEWAY_MAX_RETRIES must be between 0 and 10", envPrefix)
 	check(c.WaitMaxWaiters >= 1, "%sWAIT_MAX_WAITERS must be at least 1", envPrefix)
 	check(c.RelayBatch >= 1, "%sRELAY_BATCH must be at least 1", envPrefix)
+	check(c.ReconcileNotFoundLimit >= 1, "%sRECONCILE_NOT_FOUND_LIMIT must be at least 1", envPrefix)
 	check(c.DatabaseURL != "", "%sDATABASE_URL is required", envPrefix)
 	check(c.AdminAddr != "", "%sADMIN_ADDR is required", envPrefix)
 	check(!c.Roles.API || c.AdminAddr != c.HTTPAddr,
@@ -315,6 +330,15 @@ func (l *loader) level(name string, def slog.Level) slog.Level {
 		l.fail(name, err)
 	}
 	return lv
+}
+
+// oneOf reads a value that must be one of allowed.
+func (l *loader) oneOf(name, def string, allowed ...string) string {
+	v := l.str(name, def)
+	if !slices.Contains(allowed, v) {
+		l.fail(name, fmt.Errorf("%q is not one of %v", v, allowed))
+	}
+	return v
 }
 
 func (l *loader) roles(name, def string) Roles {

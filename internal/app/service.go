@@ -9,8 +9,29 @@ import (
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
 
+// StartMode selects how StartPayment calls the gateway.
+type StartMode string
+
+// Start modes.
+const (
+	// StartTwoPhase records an attempt, calls the gateway with no
+	// transaction open, then applies the answer (v2, the default).
+	StartTwoPhase StartMode = "two_phase"
+	// StartInTx calls the gateway inside the transaction that holds the
+	// payment's row lock (v1). It is kept so the two can be compared.
+	StartInTx StartMode = "in_tx"
+)
+
 // Config holds the tunables of the use cases.
 type Config struct {
+	// StartMode selects the v1 or the v2 start.
+	StartMode StartMode
+	// ReconcileInterval is the pause between two lookups of an ambiguous
+	// gateway attempt.
+	ReconcileInterval time.Duration
+	// ReconcileNotFoundLimit is how many certain "not found" answers abandon
+	// an ambiguous attempt, so that a new one may be made.
+	ReconcileNotFoundLimit int
 	// PollInterval is the delay between two gateway polls of a payment that
 	// is not final yet.
 	PollInterval time.Duration
@@ -29,6 +50,7 @@ type Config struct {
 type Deps struct {
 	Tx       ports.TxRunner
 	Payments ports.PaymentStore
+	Attempts ports.Attempts
 	Tasks    ports.Enqueuer
 	Events   ports.EventRecorder
 	Gateway  ports.Gateway
@@ -45,6 +67,7 @@ type Deps struct {
 type Service struct {
 	tx       ports.TxRunner
 	payments ports.PaymentStore
+	attempts ports.Attempts
 	tasks    ports.Enqueuer
 	events   ports.EventRecorder
 	gateway  ports.Gateway
@@ -59,13 +82,14 @@ type Service struct {
 // NewService returns a Service. It panics if a dependency is missing: that is
 // a wiring bug that must fail at start, not on the first request.
 func NewService(d Deps, cfg Config) *Service {
-	if d.Tx == nil || d.Payments == nil || d.Tasks == nil || d.Events == nil ||
+	if d.Tx == nil || d.Payments == nil || d.Attempts == nil || d.Tasks == nil || d.Events == nil ||
 		d.Gateway == nil || d.Watcher == nil || d.Clock == nil || d.Metrics == nil || d.NewID == nil || d.Logger == nil {
 		panic("app: NewService: missing dependency")
 	}
 	return &Service{
 		tx:       d.Tx,
 		payments: d.Payments,
+		attempts: d.Attempts,
 		tasks:    d.Tasks,
 		events:   d.Events,
 		gateway:  d.Gateway,

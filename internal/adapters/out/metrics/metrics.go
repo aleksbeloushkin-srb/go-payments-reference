@@ -20,7 +20,12 @@ type Business struct {
 	created     prometheus.Counter
 	transitions *prometheus.CounterVec
 	timeToFinal *prometheus.HistogramVec
+	reconciled  *prometheus.CounterVec
 }
+
+// reconcileOutcomes lists every value of the outcome label of
+// reconcile_total.
+var reconcileOutcomes = []string{"found", "not_found", "abandoned", "duplicate", "error"}
 
 // NewBusiness creates the business metrics and registers them on reg.
 func NewBusiness(reg prometheus.Registerer) *Business {
@@ -39,9 +44,22 @@ func NewBusiness(reg prometheus.Registerer) *Business {
 			// From an instant decline to the end of polling (two hours).
 			Buckets: []float64{0.5, 1, 2, 5, 10, 30, 60, 300, 900, 3600, 7200},
 		}, []string{"status"}),
+		reconciled: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "reconcile_total",
+			Help: "Reconciliations of ambiguous gateway attempts by outcome: found, not_found, abandoned, duplicate, error.",
+		}, []string{"outcome"}),
 	}
-	reg.MustRegister(b.created, b.transitions, b.timeToFinal)
+	reg.MustRegister(b.created, b.transitions, b.timeToFinal, b.reconciled)
+	// Created at zero so increase() sees the first "duplicate" or "error".
+	for _, o := range reconcileOutcomes {
+		b.reconciled.WithLabelValues(o)
+	}
 	return b
+}
+
+// Reconciled counts one reconciliation outcome.
+func (b *Business) Reconciled(outcome string) {
+	b.reconciled.WithLabelValues(outcome).Inc()
 }
 
 // PaymentCreated counts a new payment.

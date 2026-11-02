@@ -16,10 +16,11 @@ const (
 	TaskStartPayment      TaskKind = "start_payment"
 	TaskPollPayment       TaskKind = "poll_payment"
 	TaskApplyGatewayEvent TaskKind = "apply_gateway_event"
+	TaskReconcilePayment  TaskKind = "reconcile_payment"
 )
 
 // TaskKinds lists every kind. A test checks that each one has a handler.
-var TaskKinds = []TaskKind{TaskStartPayment, TaskPollPayment, TaskApplyGatewayEvent}
+var TaskKinds = []TaskKind{TaskStartPayment, TaskPollPayment, TaskApplyGatewayEvent, TaskReconcilePayment}
 
 // TaskSpec describes a task to schedule.
 type TaskSpec struct {

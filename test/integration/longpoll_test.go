@@ -123,7 +123,7 @@ func TestLongPollRegistryFull(t *testing.T) {
 	e := newEnv(t, app.Config{})
 	e.waiters = longpoll.NewRegistry(1, longpoll.NewMetrics(prometheus.NewRegistry()))
 	e.svc = app.NewService(app.Deps{
-		Tx: e.tx, Payments: e.payments, Tasks: e.tasks, Events: e.outbox, Gateway: e.gateway,
+		Tx: e.tx, Payments: e.payments, Attempts: e.attempts, Tasks: e.tasks, Events: e.outbox, Gateway: e.gateway,
 		Watcher: e.waiters, Clock: e.clock, Metrics: metrics.NewBusiness(prometheus.NewRegistry()), NewID: newV7, Logger: discard(),
 	}, app.Config{PollInterval: time.Second, PollTimeout: time.Hour, WaitTimeout: 10 * time.Second, WaitReadTimeout: 2 * time.Second})
 	srv := startAPI(t, e)

@@ -24,16 +24,24 @@ func (s *Service) applyStatus(ctx context.Context, id uuid.UUID, status payment.
 		if err != nil {
 			return fmt.Errorf("lock payment: %w", err)
 		}
-		change, err = s.transition(ctx, &p, status, ref)
-		if errors.Is(err, payment.ErrInvalidTransition) {
-			return s.rejectTransition(ctx, p, status, err)
-		}
+		change, err = s.applyLocked(ctx, &p, status, ref)
 		return err
 	})
 	if err == nil {
 		s.report(change)
 	}
 	return err
+}
+
+// applyLocked applies a status reported by the gateway to a payment whose
+// row the caller has locked. A stale or conflicting report is handled by
+// rejectTransition instead of failing the caller.
+func (s *Service) applyLocked(ctx context.Context, p *payment.Payment, status payment.Status, ref string) (*statusChange, error) {
+	change, err := s.transition(ctx, p, status, ref)
+	if errors.Is(err, payment.ErrInvalidTransition) {
+		return nil, s.rejectTransition(ctx, *p, status, err)
+	}
+	return change, err
 }
 
 // statusChange is a status change made inside a transaction. It is reported
