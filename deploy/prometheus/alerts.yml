@@ -41,7 +41,14 @@ groups:
           severity: page
         annotations:
           summary: "A gateway attempt has been open for more than five minutes"
-          runbook: "Check reconcile_total{outcome=\"error\"} and the gateway lookup; the payment waits in pending until the attempt is settled."
+          runbook: "Check reconcile_total{outcome=\"error\"} and the gateway lookup. If the attempt's reconcile_payment task is dead, fix the cause and requeue that task; re-running start_payment does not revive it."
+      - alert: GatewayDuplicateCharge
+        expr: sum(increase(gateway_duplicates_detected_total[15m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "The gateway holds more than one payment for one bank payment"
+          runbook: "Find 'gateway holds several payments' in the logs for the payment id and gateway references, refund the extra gateway payment, then close the dead task."
       - alert: GatewayAmbiguousRatio
         expr: |
           sum by (op) (rate(gateway_requests_total{outcome="ambiguous"}[10m]))
