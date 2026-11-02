@@ -46,6 +46,7 @@ services:
       # two_phase (v2, default) or in_tx (v1); see README, "v1 to v2".
       PAYMENTS_START_MODE: ${PAYMENTS_START_MODE:-two_phase}
       PAYMENTS_WORKER_CONCURRENCY: ${PAYMENTS_WORKER_CONCURRENCY:-4}
+      PAYMENTS_DUPLICATE_CHECK_DELAY: ${PAYMENTS_DUPLICATE_CHECK_DELAY:-10m}
     ports:
       - "8080:8080"
       # Admin listener: /metrics, /healthz, /readyz. Published for local use

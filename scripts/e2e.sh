@@ -23,6 +23,8 @@ case $START_MODE in two_phase | in_tx) ;; *)
   ;;
 esac
 export PAYMENTS_START_MODE=$START_MODE
+# Run the duplicate check after an abandoned attempt within the test.
+export PAYMENTS_DUPLICATE_CHECK_DELAY=${PAYMENTS_DUPLICATE_CHECK_DELAY:-5s}
 
 pass=0
 log() { printf '%s\n' "$*" >&2; }
@@ -126,7 +128,7 @@ expect "same key, different body" "${out%% *}" 422
 expect "happy path" "$(follow "$id")" succeeded
 if two_phase; then
   expect "one gateway attempt, done" "$(attempts_of "$id")" done
-  expect "attempt key is <payment id>:1" "$(sql "SELECT idempotency_key FROM gateway_attempts WHERE payment_id='$id'")" "$id:1"
+  expect "attempt 1 uses the v1 key, the payment id" "$(sql "SELECT idempotency_key FROM gateway_attempts WHERE payment_id='$id'")" "$id"
 else
   expect "v1 records no attempts" "$(attempts_of "$id")" ""
 fi
@@ -148,6 +150,13 @@ if two_phase; then
   # Reconciliation finds nothing at the gateway, abandons attempt 1 and
   # starts attempt 2 with a new key.
   expect "attempt 1 abandoned, attempt 2 done" "$(attempts_of "$id")" "abandoned,done"
+  expect "attempt 2 has a new key" "$(sql "SELECT idempotency_key FROM gateway_attempts WHERE payment_id='$id' AND attempt=2")" "$id:2"
+  deadline=$((SECONDS + 30))
+  until [ "$(sql "SELECT state FROM tasks WHERE kind='check_duplicates' AND payment_id='$id'")" = done ]; do
+    [ $SECONDS -lt $deadline ] || fail "the duplicate check after the abandoned attempt did not finish"
+    sleep 1
+  done
+  ok "duplicate check after the abandoned attempt found one gateway payment"
 else
   expect "start task retried with the same key" "$(sql "SELECT attempts FROM tasks WHERE kind='start_payment' AND payment_id='$id'")" 1
 fi
@@ -157,10 +166,10 @@ log "==> gateway answers 409 (same key in progress), then 401 (bad credentials)"
 gw_control "faults=409,401"
 id=$(new_payment 2150)
 expect "payment after 409 and 401 is not failed" "$(follow "$id")" succeeded
+# 409 means the gateway knows the key: both modes retry with the same key.
+expect "start task retried twice" "$(sql "SELECT attempts FROM tasks WHERE kind='start_payment' AND payment_id='$id'")" 2
 if two_phase; then
-  expect "409 attempt abandoned, next attempt done" "$(attempts_of "$id")" "abandoned,done"
-else
-  expect "start task needed two retries" "$(sql "SELECT attempts FROM tasks WHERE kind='start_payment' AND payment_id='$id'")" 2
+  expect "one attempt, never abandoned" "$(attempts_of "$id")" done
 fi
 
 log "==> gateway executes the payment, then hangs (ambiguous outcome)"
@@ -177,10 +186,12 @@ expect "the client was charged once" "$(curl -sS "$GW/v1/payments?reference=$id"
 if two_phase; then
   deadline=$((SECONDS + 30))
   until [ "$(attempts_of "$id")" = done ]; do
-    [ $SECONDS -lt $deadline ] || fail "the hung attempt was not reconciled: $(attempts_of "$id")"
+    [ $SECONDS -lt $deadline ] || fail "the hung attempt was not closed: $(attempts_of "$id")"
     sleep 1
   done
-  ok "the hung attempt was reconciled to done"
+  # The gateway's event arrives before the call times out and closes the
+  # attempt; reconciliation is needed only if it does not.
+  ok "the hung attempt was closed"
 fi
 
 log "==> webhooks dropped: polling finishes the job"
@@ -222,10 +233,11 @@ at_least "conflict 422 counted" "$(metric 'http_requests_total{code="422",method
 at_least "long polls in their own histogram" "$(metric http_long_poll_duration_seconds_count)" 1
 at_least "start tasks succeeded" "$(metric 'task_attempts_total{kind="start_payment",outcome="ok"}')" 1
 if two_phase; then
-  # Ambiguous calls go to reconciliation; only the 401 is a task retry.
-  at_least "start tasks retried" "$(metric 'task_attempts_total{kind="start_payment",outcome="retry"}')" 1
-  at_least "reconcile found the hung payment" "$(metric 'reconcile_total{outcome="found"}')" 1
-  at_least "reconcile abandoned the unexecuted attempts" "$(metric 'reconcile_total{outcome="abandoned"}')" 2
+  # 500 and the hung call go to reconciliation; 409 and 401 are task retries.
+  at_least "start tasks retried" "$(metric 'task_attempts_total{kind="start_payment",outcome="retry"}')" 2
+  at_least "reconcile counted the not-found answers" "$(metric 'reconcile_total{outcome="not_found"}')" 2
+  at_least "reconcile abandoned the unexecuted attempt" "$(metric 'reconcile_total{outcome="abandoned"}')" 1
+  expect "no duplicate charge detected" "$(metric gateway_duplicates_detected_total)" 0
   expect "no attempt left open" "$(metric 'gateway_attempts{state="unknown"}')" 0
   expect "no open attempt age" "$(metric gateway_attempt_oldest_open_seconds)" 0
 else
@@ -253,6 +265,7 @@ until [ "$(prom_query 'up{job="payments"}')" = 1 ]; do
 done
 ok "scrape target is up"
 expect "alert rule groups loaded" "$(curl -sS "$PROM/api/v1/rules" | jq '.data.groups | length')" 4
+expect "alert rules loaded" "$(curl -sS "$PROM/api/v1/rules" | jq '[.data.groups[].rules[]] | length')" 11
 deadline=$((SECONDS + 60))
 until curl -sS "$PROM/api/v1/alerts" | jq -e '.data.alerts[] | select(.labels.alertname == "GatewayMisconfigured")' >/dev/null; do
   [ $SECONDS -lt $deadline ] || fail "GatewayMisconfigured did not fire after the 401 answer"
@@ -260,6 +273,7 @@ until curl -sS "$PROM/api/v1/alerts" | jq -e '.data.alerts[] | select(.labels.al
 done
 ok "GatewayMisconfigured fires after the 401 answer"
 expect "DeadTasks does not fire" "$(curl -sS "$PROM/api/v1/alerts" | jq '[.data.alerts[] | select(.labels.alertname == "DeadTasks")] | length')" 0
+expect "GatewayDuplicateCharge does not fire" "$(curl -sS "$PROM/api/v1/alerts" | jq '[.data.alerts[] | select(.labels.alertname == "GatewayDuplicateCharge")] | length')" 0
 
 log "==> graceful stop"
 docker compose stop payments >/dev/null
