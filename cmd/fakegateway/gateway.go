@@ -174,10 +174,17 @@ func (g *gateway) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error(), "code": "idempotency_key_reused"})
 		return
 	}
+	// A new payment is answered with its state at execution time: the
+	// settle goroutine may change the stored status before the answer is
+	// written. A replay reads the current state under the lock.
+	var answer record
 	if created {
 		g.count("executions")
-		snapshot := *rec
+		answer = *rec // nothing else holds rec before settle starts
+		snapshot := answer
 		g.goBackground(func() { g.settle(snapshot) })
+	} else {
+		answer = g.view(rec.Ref)
 	}
 	if fault == "hang" {
 		// The payment exists now, but the caller never hears about it: the
@@ -199,7 +206,7 @@ func (g *gateway) create(w http.ResponseWriter, r *http.Request) {
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, g.view(rec.Ref))
+	writeJSON(w, status, answer)
 }
 
 // store deduplicates by Idempotency-Key, as real gateways do.
