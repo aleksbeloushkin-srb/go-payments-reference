@@ -247,6 +247,22 @@ func TestRetryPolicy(t *testing.T) {
 // Credentials, routes and unknown 4xx answers are our mistake, not the
 // payment's: the error is "unavailable" (retry) and "misconfigured" (alert),
 // never a decline.
+// 409 and 425 are ambiguous and, in addition, say the key is known to the
+// gateway, so the caller keeps the key instead of abandoning it.
+func TestInProgressIsAmbiguousAndKeepsTheKey(t *testing.T) {
+	for _, code := range []int{http.StatusConflict, http.StatusTooEarly} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))
+		c, _ := newClient(t, srv.URL, Config{MaxRetries: 2})
+
+		_, err := c.CreatePayment(context.Background(), request())
+		srv.Close()
+
+		if !errors.Is(err, ports.ErrGatewayAmbiguous) || !errors.Is(err, ports.ErrGatewayInProgress) {
+			t.Errorf("status %d: err = %v, want ambiguous and in progress", code, err)
+		}
+	}
+}
+
 func TestConfigurationErrorsNeverDeclineThePayment(t *testing.T) {
 	for _, code := range []int{401, 403, 404, 405, 418} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))

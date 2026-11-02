@@ -11,9 +11,8 @@
 // Every other failure of a write is ambiguous: a timeout after the request
 // left, a reset connection, a 5xx, or a 409/425 saying that a request with
 // this key is still in progress may hide a payment that went through. The
-// client reports ports.ErrGatewayAmbiguous and does not retry; the task
-// layer retries later with the same Idempotency-Key, which the gateway uses
-// to return the original result instead of charging twice.
+// client reports ports.ErrGatewayAmbiguous (with ports.ErrGatewayInProgress
+// for 409/425) and does not retry; the task layer decides what to do.
 //
 // Only an explicit decline (400, 402, 422) fails a payment. 401, 403, 404,
 // 405 and unknown 4xx answers mean our credentials or URL are wrong: they
@@ -315,7 +314,7 @@ func (c *Client) classify(resp *http.Response, write bool, path string, decode f
 		return failed(fmt.Errorf("%w: status %d: %s", ports.ErrGatewayRejected, code, snippet(resp.Body)))
 	case write && (code == http.StatusConflict || code == http.StatusTooEarly):
 		// A request with this idempotency key is still being processed.
-		return failed(fmt.Errorf("%w: status %d, request with this key still in progress", ports.ErrGatewayAmbiguous, code))
+		return failed(fmt.Errorf("%w: %w: status %d", ports.ErrGatewayAmbiguous, ports.ErrGatewayInProgress, code))
 	case code >= 400 && code < 500:
 		return failed(fmt.Errorf("%w: %w: status %d: %s",
 			ports.ErrGatewayUnavailable, ports.ErrGatewayMisconfigured, code, snippet(resp.Body)))
