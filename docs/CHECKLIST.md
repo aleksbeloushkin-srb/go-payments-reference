@@ -70,6 +70,8 @@ IMPROVEMENTS.md.
 
 - [x] No network calls between `BEGIN` and `COMMIT`: the two-phase start (default since v2) records an attempt, commits, calls the gateway, then applies the answer in a second transaction; the relay publishes outside any transaction. The v1 start (`PAYMENTS_START_MODE=in_tx`) still calls inside the transaction, on purpose, for comparison.
 - [x] The intent of an external call is committed before the call, with its idempotency key, so a crash leaves a record of what to check.
+- [x] Retries after a mode or version change reuse the same idempotency key for the same call (attempt 1 sends the v1 key).
+- [x] Every path that gives up on a key (abandoning an attempt) is followed by a duplicate check; a double charge is counted, alerted and handed to an operator. Attempts per payment are capped.
 - [x] The `Commit` error is checked; a failed commit is treated as ambiguous in the documentation of `pkg/txctx`.
 - [x] The pool is bounded and larger than the concurrency that can hold connections; validated at start.
 - [x] Server-side limits are set: `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`.

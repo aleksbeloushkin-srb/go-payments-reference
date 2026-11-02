@@ -30,8 +30,11 @@ design, its crash-point table and the implementation notes are in
 [proposal 0001](proposals/0001-gateway-call-outside-transaction.md); the
 measured effect is in the README, section "v1 to v2". The v1 start remains
 selectable with `PAYMENTS_START_MODE=in_tx` for comparison and is planned to
-be removed after one release. The text below is the plan as written before
-the implementation.
+be removed after one release; switching between the modes is safe, because
+attempt 1 sends the v1 key. The independent review of v2 led to an attempt
+cap, a duplicate check after abandoned attempts and key compatibility
+between the modes (proposal 0001, implementation notes). The text below is
+the plan as written before the implementation.
 
 In v1, `StartPayment` locks the payment row, calls the gateway and commits,
 all in one transaction (`internal/app/start.go`). Version 2 breaks it into

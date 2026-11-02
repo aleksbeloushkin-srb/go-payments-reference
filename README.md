@@ -113,10 +113,12 @@ the data model and sequence diagrams for every flow are in
    transaction inserts the payment (or finds the existing one for the key),
    a `start_payment` task and a `payment.created` event.
 2. **Start.** The worker claims the task with a lease. It records attempt
-   `n` and its key `<payment id>:<n>` in a short transaction, calls the
-   gateway with no transaction open, and applies the answer in a second
-   short transaction. An ambiguous answer marks the attempt `unknown`; a
-   `reconcile_payment` task then looks the payment up at the gateway. This is
+   `n` and its key (the payment id for attempt 1, `<payment id>:<n>` after
+   an abandoned attempt) in a short transaction, calls the gateway with no
+   transaction open, and applies the answer in a second short transaction.
+   A 409 "in progress" keeps the key for a retry; an ambiguous answer marks
+   the attempt `unknown`, and a `reconcile_payment` task looks the payment
+   up at the gateway. This is
    v2; the v1 start, which calls inside the transaction, is kept for
    comparison (see "v1 to v2").
 3. **Poll.** Every payment that is not final has a `poll_payment` task,
@@ -156,38 +158,60 @@ make compare                                           # both modes under a slow
 `scripts/compare-start-modes.sh` runs each mode against a fake gateway that
 executes a payment, sends its webhook after 200 ms and answers the create
 call after `LATENCY`, with 9 workers and a pool of 12 connections, and reads
-the numbers from `/metrics`. Measured on a laptop with Docker in a VM
-(colima); expect different absolute numbers elsewhere:
+the numbers from `/metrics`. Three runs per setup on a laptop with Docker in
+a VM (colima); the cells give the range over the runs:
 
 | Setup | Mode | Pool acquisitions that waited | Pool wait, s total | p95 create to final, s | p95 `POST /v1/payments`, s | Webhook accepted to applied, mean s |
 | --- | --- | --- | --- | --- | --- | --- |
-| 60 payments, 20 clients, 1 s latency | `in_tx` | 53 | 0.27 | 4.50 | 0.050 | 3.07 |
-| | `two_phase` | 19 | 0.21 | 4.57 | 0.062 | 3.07 |
-| 80 payments, 40 clients, 2 s latency | `in_tx` | 114 | 0.20 | 28.2 | 0.024 | 9.5 |
-| | `two_phase` | 10 | 0.13 | 27.9 | 0.035 | 11.0 |
+| 60 payments, 20 clients, 1 s latency | `in_tx` | 48 to 58 | 0.22 to 0.25 | 4.4 to 4.6 | 0.042 to 0.070 | 3.07 to 3.15 |
+| | `two_phase` | 20 to 31 | 0.29 to 0.40 | 4.5 to 4.8 | 0.070 to 0.079 | 2.74 to 3.09 |
+| 80 payments, 40 clients, 2 s latency | `in_tx` | 106 to 221 | 0.26 to 0.79 | 20 to 28 | 0.045 to 0.100 | 8.4 to 11.0 |
+| | `two_phase` | 12 to 58 | 0.13 to 0.90 | 28 | 0.036 to 0.130 | 9.6 to 11.2 |
 
-What the numbers say:
+What the numbers say, and what they do not:
 
-- **The pool is relieved.** In v1 each running start holds a connection for
-  the whole call, so other work waits for connections 5 to 11 times as
-  often. With a busier API or a smaller pool, those waits become latency
-  and timeouts; v2 removes the cause. The integration test
-  `TestNoConnectionHeldDuringTheCall` shows it directly: one connection
-  acquired and one session idle in a transaction during the call in v1, none
-  in v2.
-- **Latency does not improve here, and that is expected.** Both modes keep
-  a worker slot busy for the whole call, so throughput is `workers /
-  latency` either way, and the worker's batch barrier (REVIEW.md, W3) holds
-  webhook tasks behind the start calls. The row lock that v1 holds never
-  delays a webhook in this setup, because the webhook's task is claimed only
-  after the batch, when the lock is gone. Continuous claiming
-  (IMPROVEMENTS.md, item 4) is what turns v2's freed resources into lower
-  latency.
-- **Correctness differs where the numbers do not show it.** After a crash
-  between the gateway's success and our commit, v1 has no record that a
-  call happened; v2 has an attempt that reconciliation settles. The fault
-  "execute, then hang" ends with exactly one gateway execution in both modes
-  in the end-to-end script, but only v2 knows why.
+- **Fewer acquisitions wait for a connection.** In every run, v1 had more
+  acquisitions that found the pool empty: about 1.5 to 3 times as many in the
+  first setup and 2 to 18 times in the second. That is the effect of holding
+  a connection during each call.
+- **The wait itself does not shrink here, and latency does not improve.**
+  The total wait stays under a second per run in both modes and was often
+  somewhat higher in v2, as was p95 create latency: v2 runs more, shorter
+  transactions per payment (tx1, tx2, the event closing the attempt). Both
+  modes keep a worker slot busy for the whole call, so throughput is
+  `workers / latency` either way, and the batch barrier (REVIEW.md, W3)
+  holds webhook tasks behind the start calls. p95 create to final falls
+  inside one histogram bucket (4 to 5 s, 10 to 30 s) and does not separate
+  the modes. The v1 row lock never delays a webhook in this setup, because
+  the webhook's task is claimed only after the batch, when the lock is gone.
+  Continuous claiming (IMPROVEMENTS.md, item 4) is what would turn v2's
+  freed connections into lower latency.
+- **Ambiguous answers cost more time in v2.** v1 retries a 5xx after a
+  backoff of about a second. v2 settles it by lookup, and a payment the
+  gateway never executed is abandoned only after three empty lookups 10 s
+  apart, so it reaches the next attempt about 30 s later.
+- **Correctness is where v2 differs.** After a crash between the gateway's
+  success and our commit, v1 has no record that a call happened; v2 has an
+  attempt that a gateway event or reconciliation settles, and a duplicate
+  check after any abandoned attempt. The fault "execute, then hang" ends with
+  exactly one gateway execution in both modes in the end-to-end script, but
+  only v2 knows why.
+
+### Upgrading from v1
+
+- **No drain needed.** Attempt 1 of the two-phase start sends the payment id,
+  the key v1 sends. A v1 call that executed before the deploy and is retried
+  afterwards is deduplicated by the gateway.
+- **Switching back is safe.** With `PAYMENTS_START_MODE=in_tx`, payments that
+  already have attempts are still finished by the two-phase start.
+- **Gateway requirements.** v2 needs a gateway that deduplicates by
+  idempotency key and can find payments by our reference (docs/EXTENDING.md).
+- **Metrics.** The `payment_time_to_final_seconds` buckets changed (11 to
+  18); dashboards and rules that use `le` across the upgrade see a
+  discontinuity. New series: `gateway_attempts`,
+  `gateway_attempt_oldest_open_seconds`, `reconcile_total`,
+  `gateway_duplicates_detected_total`, `task_duration_seconds`.
+- **Schema.** Migration 00004 adds `gateway_attempts`; it runs at start.
 
 ## How to read the code
 
@@ -319,7 +343,9 @@ reference service; each has its reason in
 | `PAYMENTS_TASK_RETRY_BASE` / `_RETRY_MAX` | `500ms` / `2m` | exponential backoff bounds |
 | `PAYMENTS_POLL_INTERVAL` / `_POLL_TIMEOUT` | `3s` / `2h` | gateway polling cadence and give-up age |
 | `PAYMENTS_START_MODE` | `two_phase` | `two_phase` (v2) or `in_tx` (v1, for comparison); any other value stops the start |
-| `PAYMENTS_RECONCILE_INTERVAL` / `_NOT_FOUND_LIMIT` | `5s` / `3` | spacing of lookups of an ambiguous attempt, and certain "not found" answers before it is abandoned |
+| `PAYMENTS_RECONCILE_INTERVAL` / `_NOT_FOUND_LIMIT` | `10s` / `3` | spacing of lookups of an ambiguous attempt, and certain "not found" answers before it is abandoned; together they must cover the worst gateway budget |
+| `PAYMENTS_MAX_GATEWAY_ATTEMPTS` | `3` | attempts per payment; past the cap the task goes dead for an operator |
+| `PAYMENTS_DUPLICATE_CHECK_DELAY` | `10m` | when, after an attempt that follows an abandoned one, the gateway is asked again for duplicates |
 | `PAYMENTS_WAIT_TIMEOUT` / `_READ_TIMEOUT` / `_MAX_WAITERS` / `_BATCH_INTERVAL` | `15s` / `2s` / `2000` / `200ms` | long-poll soft timeout, bound on each database read, per-instance cap, batcher tick |
 | `PAYMENTS_RELAY_INTERVAL` / `_BATCH` / `_LEASE` | `500ms` / `50` / `1m` | outbox relay cadence, batch size, claim lease |
 | `PAYMENTS_EVENTS_WEBHOOK_URL` / `_TIMEOUT` | empty / `5s` | optional subscriber for outbox events; per-delivery timeout (the lease must be at least twice as long) |

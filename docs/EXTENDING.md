@@ -33,17 +33,24 @@ adapter that implements the same two methods.
    the gateway's documentation for its decline codes and for 5xx: some
    promise that a 5xx means "not executed", most do not. When in doubt, it
    is ambiguous.
-4. **Check idempotency and lookup support.** The two-phase start sends
-   `Idempotency-Key: <payment id>:<attempt>` and settles an ambiguous call by
-   looking the payment up by our reference (`FindByReference`), not by
-   calling again. It needs the gateway to support at least one of the two,
-   and lookup is what makes "not found" certain. Check how soon a new
-   payment becomes visible to the lookup and set
-   `PAYMENTS_RECONCILE_INTERVAL` and `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` so
-   that an attempt is abandoned only well after that: abandoning too early
-   and starting attempt `n+1` with a new key is the one way left to charge a
-   client twice. A gateway with neither idempotency keys nor lookup cannot be
-   made safe by any client design.
+4. **Check idempotency and lookup support: both are required.** The
+   two-phase start needs the gateway to:
+   - **deduplicate by idempotency key.** After a crash between the call and
+     tx2, the retry re-sends the open attempt's key (the payment id for
+     attempt 1, `<payment id>:<n>` later) without looking up first; only
+     deduplication keeps that from executing twice;
+   - **find payments by our reference.** Ambiguous answers (timeouts, 5xx)
+     are settled only by lookup (`FindByReference`), and an empty answer must
+     be a certain "not found";
+   - **show a new payment to the lookup promptly.** An attempt is abandoned
+     after `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` empty answers
+     `PAYMENTS_RECONCILE_INTERVAL` apart, and attempt `n+1` uses a new key. If
+     the lookup shows the first payment later than that, the client is
+     charged twice; the duplicate check after the new attempt detects it for
+     an operator but cannot prevent it. Set the window from the gateway's
+     documented consistency.
+
+   A gateway that lacks either mechanism cannot be made safe by this design.
 5. **Webhooks.** Each gateway signs webhooks its own way. Verify the
    signature before reading the body as JSON, reject old timestamps, and
    deduplicate by the gateway's event id. `pkg/hmacsig` shows one scheme;

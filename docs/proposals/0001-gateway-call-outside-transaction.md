@@ -54,7 +54,10 @@ exactly-once delivery.
 
 ### Data
 
-A new table, additive migration:
+A new table, additive migration. As proposed (the implemented schema is
+[`migrations/00004_gateway_attempts.sql`](../../migrations/00004_gateway_attempts.sql);
+it adds a `not_found` count, a partial unique index that allows one open
+attempt per payment, and an index for the metrics query):
 
 ```sql
 CREATE TABLE gateway_attempts (
@@ -71,7 +74,8 @@ CREATE INDEX gateway_attempts_open ON gateway_attempts (updated_at) WHERE state 
 ```
 
 The idempotency key is `<payment id>:<attempt>`. It is stable for one attempt
-and different for a deliberate new attempt.
+and different for a deliberate new attempt. (Implemented differently for
+attempt 1, which uses the payment id; see the implementation notes.)
 
 ### Flow
 
@@ -105,13 +109,17 @@ and a new attempt `n+1` may be created.
 | --- | --- | --- | --- |
 | Before tx1 commits | nothing new | task retried, tx1 runs again | no |
 | After tx1, before the call | attempt `intent`, no call made | task retried; it reuses the open attempt and its key | no: the first real call happens now |
-| After the call, before tx2 | attempt `intent`, gateway may have executed | retry reuses the same key, or reconcile finds the payment | no, if the gateway deduplicates by key or supports lookup by reference |
+| After the call, before tx2 | attempt `intent`, gateway may have executed | retry reuses the same key, or reconcile finds the payment | no, if the gateway deduplicates by key: the retry re-sends the reused intent's key without looking up first |
 | During tx2 | rolled back to `intent` | as the previous row | no |
 | After tx2 | attempt `done`, status applied | nothing | no |
 
-A gateway with neither idempotency keys nor lookup by reference cannot be
-made safe by any client-side design; the proposal states this as a
-precondition.
+The design needs the gateway to support **both** idempotency keys and lookup
+by reference, for different paths. Deduplication by key covers crash row 3:
+a reused intent is sent again with the same key. Lookup covers ambiguous
+answers, which are settled only by looking the payment up. And abandoning an
+attempt after "not found" answers is safe only if the lookup shows a payment
+soon after its create call; the duplicate check after the next attempt
+detects, but cannot prevent, a payment that shows up later.
 
 ### Concurrency
 
@@ -168,23 +176,45 @@ Metrics: attempts by state, age of the oldest `intent` or `unknown` attempt
 
 ## Implementation notes
 
-What v2 does where the proposal left a choice, and where it differs:
+What v2 does where the proposal left a choice, and where it differs. The
+second half of the table comes from the independent review of v2.
 
 | Topic | Implementation |
 | --- | --- |
 | Reconcile | Lookup by reference only (`GET /v1/payments?reference=`), never a repeated create: a lookup can answer "not found" with certainty, a repeated create cannot tell "executed now" from "executed before". |
-| Abandoning | After `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` (3) certain "not found" answers, `PAYMENTS_RECONCILE_INTERVAL` (5 s) apart. A failed lookup is retried and never counted. A new attempt starts through a start task with the dedup key `start:<n+1>`. |
-| Several matches | The gateway holds more than one payment for one bank payment: the reconcile task goes dead and the error is logged, because only a person can refund the extra charge. |
+| Abandoning | After `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` (3) certain "not found" answers, `PAYMENTS_RECONCILE_INTERVAL` (10 s) apart; the configuration requires the window to cover the worst gateway budget, so no call of ours can still be in flight. A failed lookup is retried and never counted. A new attempt starts through a start task with the dedup key `start:<n+1>`. |
+| Several matches | The gateway holds more than one payment for one bank payment: the task goes dead, `gateway_duplicates_detected_total` grows and `GatewayDuplicateCharge` pages. The refund is an operator action; this repository refunds nothing automatically. |
 | Unknown attempt and start retries | While an attempt is `unknown`, a start retry never calls the gateway; reconciliation owns the attempt. |
 | One open attempt | Enforced by a partial unique index, not only by the row lock. |
 | Payment status | Stays `pending` while an attempt is `unknown`, as proposed. |
-| Call deadline | The worker's task timeout (30 s), validated to be at least 10 s shorter than the lease (60 s). |
+| Call deadline | The worker's task timeout (30 s), validated to be at least 10 s shorter than the lease (60 s) and 5 s longer than the worst gateway budget, so tx2 or the switch to `unknown` always has time to run. |
+| Key of attempt 1 | The payment id, the key the v1 start sends; `<payment id>:<n>` from attempt 2. A v1 call that executed without committing is deduplicated when the two-phase start retries it, so upgrading from v1 cannot charge twice. |
+| Switching modes | `in_tx` hands any payment that has attempts to the two-phase start, decided under the payment's row lock. Switching in either direction, at any time, sends no second key for the same call. |
+| Gateway event during or after the call | When a payment leaves `pending` with a gateway reference, the event handler closes its open attempt; a start retry for a payment that has left `pending` does the same. A crash after the call followed by the gateway's event no longer leaves an attempt open forever. |
+| 409 and 425 | "A request with this key is in progress" keeps the attempt and its key and retries the task; it never leads to an abandon. |
+| Duplicate check | When an attempt that follows an abandoned one settles, a `check_duplicates` task looks the payment up after `PAYMENTS_DUPLICATE_CHECK_DELAY` (10 min). A definite answer that arrives for an abandoned attempt triggers the check at once and is not applied. |
+| Attempt cap | `PAYMENTS_MAX_GATEWAY_ATTEMPTS` (3). Past it the task goes dead (`DeadTasks`) and the payment stays `pending` for an operator. |
 | Rollout | `two_phase` is the default from the start; `in_tx` remains selectable to compare the two (README, "v1 to v2"). |
-| Metrics | `gateway_attempts{state}`, `gateway_attempt_oldest_open_seconds`, `reconcile_total{outcome}`, and the `GatewayAttemptStuck` alert (open attempt older than five minutes). |
+| Metrics | `gateway_attempts{state}` for open attempts, `gateway_attempt_oldest_open_seconds`, `reconcile_total{outcome}`, `gateway_duplicates_detected_total`, and the `GatewayAttemptStuck` and `GatewayDuplicateCharge` alerts. |
+
+### Upgrade path
+
+- **From v1.** Deploy v2 with the default `two_phase`. Payments whose v1
+  start is waiting for a retry are retried as attempt 1 with the same key the
+  v1 call used, so a call that executed before the deploy is deduplicated by
+  the gateway. Nothing needs to drain first.
+- **Back to `in_tx`.** Payments that have attempts are still finished by the
+  two-phase start; only payments without attempts take the v1 path.
+- **Mixed versions during a rolling deploy.** Both decide under the
+  payment's row lock and send the same key for the first call.
 
 Tests: one unit test per crash-point row above, which restarts the handler
 after the crash and checks the final state and that the gateway executed the
-payment once; integration tests for a webhook during the call, two workers
-on an expired lease, and the absence of held connections during the call;
-the end-to-end script runs the "execute, then hang" fault in both modes.
+payment once; regression tests for each review finding (mode switch in both
+directions, crash then event, abandoned attempt that executed late, the
+attempt cap, 409 on the same key); integration tests for a webhook during
+the call, two workers on an expired lease, concurrent starts and events, the
+absence of held connections during the call, and reconciliation on
+PostgreSQL; the end-to-end script runs the "execute, then hang" fault in both
+modes.
 

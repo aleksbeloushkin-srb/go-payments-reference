@@ -198,12 +198,14 @@ sequenceDiagram
     S->>DB: tx1: lock payment, still pending?
     S->>DB: reuse the open intent, or insert attempt n (intent), COMMIT
     Note over S,G: no transaction, connection or row lock held
-    S->>G: POST /v1/payments, Idempotency-Key = payment id:n
+    S->>G: POST /v1/payments, Idempotency-Key = attempt key
     alt definite answer
         G-->>S: processing, gw_ref
         S->>DB: tx2: lock payment, attempt n still open?
         S->>DB: transition (version + 1), outbox event, poll task, attempt n done, COMMIT
-    else ambiguous (timeout, reset, 5xx, 409)
+    else 409 or 425, key in progress
+        S-->>W: retry later, same attempt and key
+    else ambiguous (timeout, reset, 5xx)
         S->>DB: attempt n unknown, reconcile_payment task, COMMIT
     end
     W->>DB: mark task done (fenced by lease)
@@ -212,16 +214,27 @@ sequenceDiagram
 This is the default since v2 and the design of
 [proposal 0001](proposals/0001-gateway-call-outside-transaction.md). The
 attempt row is committed before the call, so after any crash the database
-says which call may have happened and with which key. A gateway event that
-arrives during the call is applied at once, and the late answer of tx2 does
-not move the payment back.
+says which call may have happened and with which key. Attempt 1's key is the
+payment id, the key of the v1 start, so the two modes deduplicate each
+other's calls; later attempts use `<payment id>:<n>`. A gateway event that
+arrives during or after the call is applied at once and closes the open
+attempt; the late answer of tx2 does not move the payment back.
 
 **Reconciliation.** `reconcile_payment` asks the gateway for the payments it
 holds under our reference. One match is applied like tx2; a certain empty
 answer is counted, and after `PAYMENTS_RECONCILE_NOT_FOUND_LIMIT` of them the
 attempt is abandoned and a start task for attempt `n+1`, with a new key, is
-enqueued; several matches send the task dead for an operator. While an
-attempt is unknown, a start retry never calls the gateway again.
+enqueued, up to `PAYMENTS_MAX_GATEWAY_ATTEMPTS`; several matches send the task
+dead for an operator. While an attempt is unknown, a start retry never calls
+the gateway again.
+
+**Duplicate check.** An attempt that follows an abandoned one may coexist
+with a late payment for the abandoned key. When such an attempt settles, a
+`check_duplicates` task looks the payment up after
+`PAYMENTS_DUPLICATE_CHECK_DELAY`; more than one gateway payment counts
+`gateway_duplicates_detected_total`, pages `GatewayDuplicateCharge` and goes
+dead with the gateway references in the log. Refunding is an operator
+action.
 
 ### Start a payment (v1, `in_tx`: gateway call inside the transaction)
 
