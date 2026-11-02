@@ -160,6 +160,15 @@ func (g *fakeGateway) CreatePayment(context.Context, ports.GatewayRequest) (port
 	return g.create, g.err
 }
 
+func (g *fakeGateway) FindByReference(context.Context, string) ([]ports.GatewayPayment, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.err != nil {
+		return nil, g.err
+	}
+	return []ports.GatewayPayment{g.create}, nil
+}
+
 func (g *fakeGateway) Payment(context.Context, string) (ports.GatewayPayment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

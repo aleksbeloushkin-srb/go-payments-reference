@@ -316,7 +316,7 @@ func TestGatewayMetricsOutcomes(t *testing.T) {
 
 func TestGatewayMetricsStartAtZero(t *testing.T) {
 	m := NewMetrics(prometheus.NewRegistry())
-	if n := testutil.CollectAndCount(m.requests); n != 2*len(outcomes) {
+	if n := testutil.CollectAndCount(m.requests); n != 3*len(outcomes) {
 		t.Fatalf("request series at start = %d, want every op and outcome at zero", n)
 	}
 }
@@ -341,6 +341,49 @@ func TestGatewayMetricsCountInlineRetries(t *testing.T) {
 	if rl, ok := testutil.ToFloat64(c.metrics.requests.WithLabelValues(opCreate, "rate_limited")),
 		testutil.ToFloat64(c.metrics.requests.WithLabelValues(opCreate, "ok")); rl != 1 || ok != 1 {
 		t.Fatalf("rate_limited = %v, ok = %v; want 1 and 1", rl, ok)
+	}
+}
+
+func TestFindByReference(t *testing.T) {
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.Query().Get("reference")
+		if gotQuery == "unknown" {
+			writeJSON(w, http.StatusOK, []paymentResponse{})
+			return
+		}
+		writeJSON(w, http.StatusOK, []paymentResponse{{Ref: "gw_1", Status: "succeeded"}})
+	}))
+	defer srv.Close()
+	// A path prefix in the base URL must survive.
+	c, _ := newClient(t, srv.URL+"/gateway", Config{})
+
+	found, err := c.FindByReference(context.Background(), "pay 1")
+	if err != nil || len(found) != 1 || found[0] != (ports.GatewayPayment{Ref: "gw_1", Status: payment.StatusSucceeded}) {
+		t.Fatalf("found = %+v, %v", found, err)
+	}
+	if gotPath != "/gateway/v1/payments" || gotQuery != "pay 1" {
+		t.Fatalf("request = %s ?reference=%q", gotPath, gotQuery)
+	}
+	none, err := c.FindByReference(context.Background(), "unknown")
+	if err != nil || len(none) != 0 {
+		t.Fatalf("unknown reference = %+v, %v; want an empty list, a certain not-found", none, err)
+	}
+	if got := testutil.ToFloat64(c.metrics.requests.WithLabelValues(opLookup, "ok")); got != 2 {
+		t.Fatalf("lookups counted = %v, want 2", got)
+	}
+}
+
+func TestFindByReferenceFailureIsNotANotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c, _ := newClient(t, srv.URL, Config{})
+
+	found, err := c.FindByReference(context.Background(), "p-1")
+	if !errors.Is(err, ports.ErrGatewayUnavailable) || found != nil {
+		t.Fatalf("found = %v, err = %v; want unavailable, not an empty list", found, err)
 	}
 }
 

@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,6 +62,7 @@ const (
 const (
 	opCreate = "create"
 	opRead   = "read"
+	opLookup = "lookup"
 )
 
 // Metrics are the gateway client's Prometheus metrics: one observation per
@@ -87,7 +89,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	// Create every series at zero. increase() and rate() ignore the first
 	// sample of a new series, so a counter that first appears at 1 would
 	// never trigger the alert that watches it.
-	for _, op := range []string{opCreate, opRead} {
+	for _, op := range []string{opCreate, opRead, opLookup} {
 		for _, o := range outcomes {
 			m.requests.WithLabelValues(op, o)
 		}
@@ -119,8 +121,7 @@ func outcome(err error) string {
 
 // result is the classified outcome of one HTTP exchange.
 type result struct {
-	payment ports.GatewayPayment
-	err     error
+	err error
 	// retry reports that the request was definitely not executed, so the
 	// client may send it again after wait.
 	retry bool
@@ -196,28 +197,51 @@ func (c *Client) CreatePayment(ctx context.Context, req ports.GatewayRequest) (p
 	if err != nil {
 		return ports.GatewayPayment{}, fmt.Errorf("gateway: encode request: %w", err)
 	}
-	return c.call(ctx, opCreate, http.MethodPost, "/v1/payments", body, req.IdempotencyKey)
+	var res ports.GatewayPayment
+	err = c.call(ctx, opCreate, http.MethodPost, "/v1/payments", body, req.IdempotencyKey, func(r io.Reader) (err error) {
+		res, err = decode(r)
+		return err
+	})
+	return res, err
 }
 
 // Payment reads a payment by the gateway's reference.
 func (c *Client) Payment(ctx context.Context, ref string) (ports.GatewayPayment, error) {
-	return c.call(ctx, opRead, http.MethodGet, "/v1/payments/"+url.PathEscape(ref), nil, "")
+	var res ports.GatewayPayment
+	err := c.call(ctx, opRead, http.MethodGet, "/v1/payments/"+url.PathEscape(ref), nil, "", func(r io.Reader) (err error) {
+		res, err = decode(r)
+		return err
+	})
+	return res, err
 }
 
-func (c *Client) call(ctx context.Context, op, method, path string, body []byte, idempotencyKey string) (ports.GatewayPayment, error) {
+// FindByReference lists the gateway payments created for reference.
+func (c *Client) FindByReference(ctx context.Context, reference string) ([]ports.GatewayPayment, error) {
+	var found []ports.GatewayPayment
+	path := "/v1/payments?reference=" + url.QueryEscape(reference)
+	err := c.call(ctx, opLookup, http.MethodGet, path, nil, "", func(r io.Reader) (err error) {
+		found, err = decodeList(r)
+		return err
+	})
+	return found, err
+}
+
+// call runs one request, retrying in-line only what was not executed. decode
+// reads a 2xx body.
+func (c *Client) call(ctx context.Context, op, method, path string, body []byte, idempotencyKey string, decode func(io.Reader) error) error {
 	for attempt := 0; ; attempt++ {
 		start := time.Now()
-		r := c.once(ctx, method, path, body, idempotencyKey)
+		r := c.once(ctx, method, path, body, idempotencyKey, decode)
 		c.metrics.duration.WithLabelValues(op).Observe(time.Since(start).Seconds())
 		c.metrics.requests.WithLabelValues(op, outcome(r.err)).Inc()
 		if r.err == nil {
-			return r.payment, nil
+			return nil
 		}
 		if !r.retry || attempt >= c.cfg.MaxRetries || !fits(ctx, r.wait) {
-			return ports.GatewayPayment{}, r.err
+			return r.err
 		}
 		if werr := c.wait(ctx, r.wait); werr != nil {
-			return ports.GatewayPayment{}, fmt.Errorf("%w (stopped waiting: %w)", r.err, werr)
+			return fmt.Errorf("%w (stopped waiting: %w)", r.err, werr)
 		}
 	}
 }
@@ -229,7 +253,7 @@ func fits(ctx context.Context, d time.Duration) bool {
 }
 
 // once performs one HTTP exchange and classifies the result.
-func (c *Client) once(ctx context.Context, method, path string, body []byte, idempotencyKey string) result {
+func (c *Client) once(ctx context.Context, method, path string, body []byte, idempotencyKey string, decode func(io.Reader) error) result {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
 	defer cancel()
 	write := method != http.MethodGet
@@ -238,7 +262,12 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, ide
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base.JoinPath(path).String(), reader)
+	// JoinPath keeps a path prefix of the base URL; the query is set apart
+	// because JoinPath would escape the "?".
+	pathPart, query, _ := strings.Cut(path, "?")
+	target := c.base.JoinPath(pathPart)
+	target.RawQuery = query
+	req, err := http.NewRequestWithContext(ctx, method, target.String(), reader)
 	if err != nil {
 		return failed(fmt.Errorf("gateway: build request: %w", err))
 	}
@@ -258,19 +287,18 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, ide
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
 		_ = resp.Body.Close()
 	}()
-	return c.classify(resp, write, path)
+	return c.classify(resp, write, path, decode)
 }
 
 // classify maps an HTTP answer to a result. Writes and reads differ: a 5xx
 // on a write may hide an executed payment, on a read it is only a failure.
-func (c *Client) classify(resp *http.Response, write bool, path string) result {
+func (c *Client) classify(resp *http.Response, write bool, path string, decode func(io.Reader) error) result {
 	switch code := resp.StatusCode; {
 	case code == http.StatusOK || code == http.StatusCreated:
-		res, err := decode(resp.Body)
-		if err != nil {
+		if err := decode(io.LimitReader(resp.Body, maxResponseBytes)); err != nil {
 			return failed(unreadable(err, write))
 		}
-		return result{payment: res}
+		return result{}
 	case code == http.StatusTooManyRequests:
 		wait := retryAfter(resp.Header.Get("Retry-After"), time.Now())
 		err := &ports.RetryAfterError{
@@ -322,9 +350,29 @@ func unreadable(err error, write bool) error {
 
 func decode(r io.Reader) (ports.GatewayPayment, error) {
 	var body paymentResponse
-	if err := json.NewDecoder(io.LimitReader(r, maxResponseBytes)).Decode(&body); err != nil {
+	if err := json.NewDecoder(r).Decode(&body); err != nil {
 		return ports.GatewayPayment{}, err
 	}
+	return toPayment(body)
+}
+
+func decodeList(r io.Reader) ([]ports.GatewayPayment, error) {
+	var body []paymentResponse
+	if err := json.NewDecoder(r).Decode(&body); err != nil {
+		return nil, err
+	}
+	out := make([]ports.GatewayPayment, 0, len(body))
+	for _, b := range body {
+		p, err := toPayment(b)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func toPayment(body paymentResponse) (ports.GatewayPayment, error) {
 	// The gateway's status vocabulary matches the domain one, so the mapping
 	// is a validation. A real gateway usually needs a translation table here.
 	status := payment.Status(body.Status)

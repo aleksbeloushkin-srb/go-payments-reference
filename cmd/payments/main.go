@@ -357,6 +357,10 @@ func (noGateway) Payment(context.Context, string) (ports.GatewayPayment, error) 
 	return ports.GatewayPayment{}, errNoGateway
 }
 
+func (noGateway) FindByReference(context.Context, string) ([]ports.GatewayPayment, error) {
+	return nil, errNoGateway
+}
+
 func newPublisher(cfg platform.Config, log *slog.Logger) outbox.Publisher {
 	logPub := publisher.NewLog(log)
 	if cfg.EventsWebhookURL == "" {

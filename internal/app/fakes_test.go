@@ -144,6 +144,9 @@ type fakeGateway struct {
 	readErr    error
 	creates    []ports.GatewayRequest
 	reads      int
+	found      []ports.GatewayPayment
+	findErr    error
+	lookups    int
 }
 
 func (g *fakeGateway) CreatePayment(_ context.Context, req ports.GatewayRequest) (ports.GatewayPayment, error) {
@@ -151,6 +154,13 @@ func (g *fakeGateway) CreatePayment(_ context.Context, req ports.GatewayRequest)
 	defer g.mu.Unlock()
 	g.creates = append(g.creates, req)
 	return g.createResp, g.createErr
+}
+
+func (g *fakeGateway) FindByReference(context.Context, string) ([]ports.GatewayPayment, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.lookups++
+	return g.found, g.findErr
 }
 
 func (g *fakeGateway) Payment(_ context.Context, _ string) (ports.GatewayPayment, error) {

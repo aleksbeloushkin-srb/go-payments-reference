@@ -57,6 +57,10 @@ type Gateway interface {
 	CreatePayment(ctx context.Context, req GatewayRequest) (GatewayPayment, error)
 	// Payment reads the gateway-side state by reference.
 	Payment(ctx context.Context, ref string) (GatewayPayment, error)
+	// FindByReference lists the gateway payments created for our reference
+	// (the payment id). An empty list is a certain "not found"; an error
+	// means the gateway could not tell.
+	FindByReference(ctx context.Context, reference string) ([]GatewayPayment, error)
 }
 
 // Metrics receives business measurements. Use cases call it only after the
