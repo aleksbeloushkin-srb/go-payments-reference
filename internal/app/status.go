@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -14,7 +15,8 @@ import (
 // applyStatus moves a payment to a status reported by the gateway, in its
 // own short transaction under a row lock.
 func (s *Service) applyStatus(ctx context.Context, id uuid.UUID, status payment.Status, ref string) error {
-	return s.tx.Run(ctx, func(ctx context.Context) error {
+	var change *statusChange
+	err := s.tx.Run(ctx, func(ctx context.Context) error {
 		p, err := s.payments.Lock(ctx, id)
 		if errors.Is(err, payment.ErrNotFound) {
 			return ports.Permanent(err)
@@ -22,12 +24,30 @@ func (s *Service) applyStatus(ctx context.Context, id uuid.UUID, status payment.
 		if err != nil {
 			return fmt.Errorf("lock payment: %w", err)
 		}
-		err = s.transition(ctx, &p, status, ref)
+		change, err = s.transition(ctx, &p, status, ref)
 		if errors.Is(err, payment.ErrInvalidTransition) {
 			return s.rejectTransition(ctx, p, status, err)
 		}
 		return err
 	})
+	if err == nil {
+		s.report(change)
+	}
+	return err
+}
+
+// statusChange is a status change made inside a transaction. It is reported
+// to metrics only after that transaction has committed.
+type statusChange struct {
+	from, to payment.Status
+	age      time.Duration
+}
+
+// report records a committed status change; nil means nothing changed.
+func (s *Service) report(c *statusChange) {
+	if c != nil {
+		s.metrics.StatusChanged(c.from, c.to, c.age)
+	}
 }
 
 // rejectTransition decides what a refused transition means. Gateway events
@@ -47,34 +67,36 @@ func (s *Service) rejectTransition(ctx context.Context, p payment.Payment, repor
 
 // transition applies the state machine, persists the change with an
 // optimistic version check, records the event and, for a non-final status,
-// makes sure a poll task exists; all in the caller's transaction. An
-// unchanged status is a no-op.
-func (s *Service) transition(ctx context.Context, p *payment.Payment, next payment.Status, ref string) error {
+// makes sure a poll task exists; all in the caller's transaction. It returns
+// the change for the caller to report after the commit, or nil when the
+// status did not change.
+func (s *Service) transition(ctx context.Context, p *payment.Payment, next payment.Status, ref string) (*statusChange, error) {
 	if ref != "" && p.GatewayRef != "" && ref != p.GatewayRef {
 		// The gateway reports another payment under our reference: a bug on
 		// one side, never something to apply silently.
 		s.log.ErrorContext(ctx, "gateway reference mismatch", "payment", *p, "reported_ref", ref)
-		return ports.Permanent(fmt.Errorf("gateway reference mismatch: stored %q, reported %q", p.GatewayRef, ref))
+		return nil, ports.Permanent(fmt.Errorf("gateway reference mismatch: stored %q, reported %q", p.GatewayRef, ref))
 	}
-	prev := p.Version
+	prev, from := p.Version, p.Status
 	changed, err := p.TransitionTo(next, s.clock.Now())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !changed {
-		return nil
+		return nil, nil
 	}
 	if ref != "" {
 		p.GatewayRef = ref
 	}
 	if err := s.payments.Update(ctx, *p, prev); err != nil {
-		return fmt.Errorf("save status change: %w", err)
+		return nil, fmt.Errorf("save status change: %w", err)
 	}
 	if err := s.events.Record(ctx, payment.NewEvent(payment.EventStatusChanged, *p)); err != nil {
-		return fmt.Errorf("record event: %w", err)
+		return nil, fmt.Errorf("record event: %w", err)
 	}
 	s.log.InfoContext(ctx, "payment status changed", "payment", *p)
-	return s.ensurePoll(ctx, *p)
+	change := &statusChange{from: from, to: p.Status, age: p.UpdatedAt.Sub(p.CreatedAt)}
+	return change, s.ensurePoll(ctx, *p)
 }
 
 // ensurePoll keeps the invariant "a payment that is not final has a poll

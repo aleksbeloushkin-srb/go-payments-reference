@@ -1,6 +1,6 @@
 // Package ports declares what the application layer needs from the outside
 // world: payment storage, a task queue, an outbox, the payment gateway, a
-// clock, a transaction runner and a change watcher.
+// clock, a transaction runner, a change watcher and business metrics.
 //
 // The interfaces belong to the consumer (internal/app), not to the adapters
 // that implement them, and they are deliberately small: a use case depends on

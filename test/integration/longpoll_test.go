@@ -12,7 +12,10 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/httpapi"
+	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/metrics"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/domain/payment"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/longpoll"
@@ -121,7 +124,7 @@ func TestLongPollRegistryFull(t *testing.T) {
 	e.waiters = longpoll.NewRegistry(1)
 	e.svc = app.NewService(app.Deps{
 		Tx: e.tx, Payments: e.payments, Tasks: e.tasks, Events: e.outbox, Gateway: e.gateway,
-		Watcher: e.waiters, Clock: e.clock, NewID: newV7, Logger: discard(),
+		Watcher: e.waiters, Clock: e.clock, Metrics: metrics.NewBusiness(prometheus.NewRegistry()), NewID: newV7, Logger: discard(),
 	}, app.Config{PollInterval: time.Second, PollTimeout: time.Hour, WaitTimeout: 10 * time.Second, WaitReadTimeout: 2 * time.Second})
 	srv := startAPI(t, e)
 	p := createPayment(t, e, "key-1", 1500).Payment

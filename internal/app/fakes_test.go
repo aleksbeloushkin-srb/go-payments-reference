@@ -179,6 +179,25 @@ func (w *fakeWatcher) Watch(uuid.UUID, int64) (<-chan int64, func(), error) {
 	}, nil
 }
 
+// fakeMetrics records what the use cases report.
+type fakeMetrics struct {
+	mu      sync.Mutex
+	created int
+	changes []string
+}
+
+func (m *fakeMetrics) PaymentCreated() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.created++
+}
+
+func (m *fakeMetrics) StatusChanged(from, to payment.Status, _ time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.changes = append(m.changes, string(from)+"->"+string(to))
+}
+
 type fixedClock struct{ now time.Time }
 
 func (c *fixedClock) Now() time.Time { return c.now }
@@ -189,6 +208,7 @@ type fixture struct {
 	gateway *fakeGateway
 	watcher *fakeWatcher
 	clock   *fixedClock
+	metrics *fakeMetrics
 }
 
 var testConfig = Config{
@@ -204,6 +224,7 @@ func newFixture(cfg Config) *fixture {
 		gateway: &fakeGateway{},
 		watcher: &fakeWatcher{ch: make(chan int64, 1)},
 		clock:   &fixedClock{now: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)},
+		metrics: &fakeMetrics{},
 	}
 	f.svc = NewService(Deps{
 		Tx:       f.store,
@@ -213,6 +234,7 @@ func newFixture(cfg Config) *fixture {
 		Gateway:  f.gateway,
 		Watcher:  f.watcher,
 		Clock:    f.clock,
+		Metrics:  f.metrics,
 		NewID:    uuid.NewV7,
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, cfg)

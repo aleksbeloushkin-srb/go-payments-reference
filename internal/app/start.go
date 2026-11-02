@@ -24,7 +24,8 @@ import (
 // shape (record the intent, call outside the transaction, apply the result
 // in a second transaction).
 func (s *Service) StartPayment(ctx context.Context, id uuid.UUID) error {
-	return s.tx.Run(ctx, func(ctx context.Context) error {
+	var change *statusChange
+	err := s.tx.Run(ctx, func(ctx context.Context) error {
 		p, err := s.payments.Lock(ctx, id)
 		if errors.Is(err, payment.ErrNotFound) {
 			return ports.Permanent(err)
@@ -47,7 +48,8 @@ func (s *Service) StartPayment(ctx context.Context, id uuid.UUID) error {
 		})
 		if errors.Is(err, ports.ErrGatewayRejected) {
 			s.log.WarnContext(ctx, "gateway rejected payment", "payment", p, "err", err)
-			return s.transition(ctx, &p, payment.StatusFailed, "")
+			change, err = s.transition(ctx, &p, payment.StatusFailed, "")
+			return err
 		}
 		if err != nil {
 			// Unavailable, misconfigured or ambiguous: roll back and let the
@@ -61,6 +63,11 @@ func (s *Service) StartPayment(ctx context.Context, id uuid.UUID) error {
 			return fmt.Errorf("create payment at gateway: %w", err)
 		}
 		// transition also schedules the poll task if the status is not final.
-		return s.transition(ctx, &p, res.Status, res.Ref)
+		change, err = s.transition(ctx, &p, res.Status, res.Ref)
+		return err
 	})
+	if err == nil {
+		s.report(change)
+	}
+	return err
 }

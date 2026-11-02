@@ -22,11 +22,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/httpapi"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/outbox"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/queue"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/gateway"
+	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/metrics"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/postgres"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/publisher"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
@@ -96,6 +98,10 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 		log.Info("migration applied", "version", r.Source.Version, "path", r.Source.Path)
 	}
 
+	// Metrics live on a registry owned by this function and injected into
+	// every component that records them; nothing uses the global default.
+	reg := prometheus.NewRegistry()
+
 	// Adapters.
 	clock := platform.SystemClock{}
 	tx := txctx.New(pool)
@@ -117,6 +123,7 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 		Gateway:  gw,
 		Watcher:  waiters,
 		Clock:    clock,
+		Metrics:  metrics.NewBusiness(reg),
 		NewID:    uuid.NewV7,
 		Logger:   log,
 	}, app.Config{

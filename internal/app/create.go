@@ -81,6 +81,7 @@ func (s *Service) CreatePayment(ctx context.Context, req CreatePaymentRequest) (
 		return CreatePaymentResult{}, err
 	}
 	if res.Created {
+		s.metrics.PaymentCreated()
 		s.log.InfoContext(ctx, "payment created", "payment", res.Payment)
 	}
 	return res, nil

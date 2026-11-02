@@ -59,6 +59,16 @@ type Gateway interface {
 	Payment(ctx context.Context, ref string) (GatewayPayment, error)
 }
 
+// Metrics receives business measurements. Use cases call it only after the
+// transaction that made the change has committed, so rolled-back work is
+// never counted.
+type Metrics interface {
+	PaymentCreated()
+	// StatusChanged reports a committed status change; age is the time since
+	// the payment was created.
+	StatusChanged(from, to payment.Status, age time.Duration)
+}
+
 // Watcher lets a use case wait until a payment's version moves past a marker
 // the client has already seen.
 type Watcher interface {

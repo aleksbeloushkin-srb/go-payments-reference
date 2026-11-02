@@ -34,6 +34,7 @@ type Deps struct {
 	Gateway  ports.Gateway
 	Watcher  ports.Watcher
 	Clock    ports.Clock
+	Metrics  ports.Metrics
 	// NewID generates payment ids. Production uses uuid.NewV7, which keeps
 	// primary-key inserts close together in the index.
 	NewID  func() (uuid.UUID, error)
@@ -49,6 +50,7 @@ type Service struct {
 	gateway  ports.Gateway
 	watcher  ports.Watcher
 	clock    ports.Clock
+	metrics  ports.Metrics
 	newID    func() (uuid.UUID, error)
 	log      *slog.Logger
 	cfg      Config
@@ -58,7 +60,7 @@ type Service struct {
 // a wiring bug that must fail at start, not on the first request.
 func NewService(d Deps, cfg Config) *Service {
 	if d.Tx == nil || d.Payments == nil || d.Tasks == nil || d.Events == nil ||
-		d.Gateway == nil || d.Watcher == nil || d.Clock == nil || d.NewID == nil || d.Logger == nil {
+		d.Gateway == nil || d.Watcher == nil || d.Clock == nil || d.Metrics == nil || d.NewID == nil || d.Logger == nil {
 		panic("app: NewService: missing dependency")
 	}
 	return &Service{
@@ -69,6 +71,7 @@ func NewService(d Deps, cfg Config) *Service {
 		gateway:  d.Gateway,
 		watcher:  d.Watcher,
 		clock:    d.Clock,
+		metrics:  d.Metrics,
 		newID:    d.NewID,
 		log:      d.Logger,
 		cfg:      cfg,

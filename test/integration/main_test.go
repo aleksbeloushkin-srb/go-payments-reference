@@ -14,9 +14,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/metrics"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/postgres"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/longpoll"
@@ -110,6 +112,7 @@ func newEnv(t *testing.T, cfg app.Config) *env {
 		Gateway:  e.gateway,
 		Watcher:  e.waiters,
 		Clock:    e.clock,
+		Metrics:  metrics.NewBusiness(prometheus.NewRegistry()),
 		NewID:    uuid.NewV7,
 		Logger:   discard(),
 	}, cfg)
