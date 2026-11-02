@@ -41,8 +41,9 @@ func NewBusiness(reg prometheus.Registerer) *Business {
 		timeToFinal: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "payment_time_to_final_seconds",
 			Help: "Time from creation to a final status.",
-			// From an instant decline to the end of polling (two hours).
-			Buckets: []float64{0.5, 1, 2, 5, 10, 30, 60, 300, 900, 3600, 7200},
+			// From an instant decline to the end of polling (two hours), fine
+			// in the first seconds, where interactive payments end.
+			Buckets: []float64{0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 30, 60, 300, 900, 3600, 7200},
 		}, []string{"status"}),
 		reconciled: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "reconcile_total",

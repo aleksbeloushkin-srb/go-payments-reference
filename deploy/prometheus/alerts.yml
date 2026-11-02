@@ -93,7 +93,7 @@ groups:
           severity: page
         annotations:
           summary: "Acquiring a database connection takes more than 50 ms on average"
-          runbook: "The pool is exhausted: check slow gateway calls holding connections (v1 start) and PAYMENTS_DB_MAX_CONNS."
+          runbook: "The pool is exhausted: check PAYMENTS_START_MODE (in_tx holds a connection during every gateway call), slow queries and PAYMENTS_DB_MAX_CONNS."
       - alert: MetricsCollectErrors
         expr: increase(metrics_collect_errors_total[10m]) > 0
         for: 10m

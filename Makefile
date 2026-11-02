@@ -3,7 +3,7 @@ PKGS    := ./...
 
 PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0
 
-.PHONY: run test test-integration e2e lint check-alerts compose-up compose-down
+.PHONY: run test test-integration e2e compare lint check-alerts compose-up compose-down
 
 ## run: build and start the whole stack in the foreground (Ctrl-C stops it)
 run:
@@ -17,9 +17,13 @@ test:
 test-integration:
 	$(GO) test -race -count=1 -tags integration $(PKGS)
 
-## e2e: start the stack, drive it with curl, tear it down
+## e2e: start the stack, drive it with curl, tear it down (START_MODE=in_tx for v1)
 e2e:
 	./scripts/e2e.sh
+
+## compare: run both start modes under a slow gateway and print the metrics
+compare:
+	./scripts/compare-start-modes.sh
 
 ## lint: formatting, vet and staticcheck (if installed)
 lint:

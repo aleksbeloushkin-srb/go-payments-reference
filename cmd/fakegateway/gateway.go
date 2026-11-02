@@ -149,9 +149,6 @@ func (g *gateway) create(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(io.Discard, r.Body)
 
 	fault, latency := g.nextFault()
-	if !wait(r.Context(), latency) {
-		return
-	}
 	switch fault {
 	case "429":
 		g.count("fault_429")
@@ -178,6 +175,7 @@ func (g *gateway) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if created {
+		g.count("executions")
 		snapshot := *rec
 		g.goBackground(func() { g.settle(snapshot) })
 	}
@@ -189,6 +187,12 @@ func (g *gateway) create(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 		case <-g.ctx.Done():
 		}
+		return
+	}
+	// A slow gateway: the payment is executed, the answer takes latency.
+	// Webhooks settle in parallel, so with a settle delay shorter than the
+	// latency a webhook arrives before the answer to the create call.
+	if !wait(r.Context(), latency) {
 		return
 	}
 	status := http.StatusOK
@@ -385,7 +389,7 @@ func (g *gateway) showControl(w http.ResponseWriter, _ *http.Request) {
 //
 //	POST /_control?faults=429,409,hang   append to the fault queue (429, 500, 409, 401, hang)
 //	POST /_control?webhook=drop          normal | drop | duplicate
-//	POST /_control?latency=300ms         added to every create call
+//	POST /_control?latency=300ms         delay of each create answer, after executing
 func (g *gateway) updateControl(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	faults, err := parseFaults(q.Get("faults"))

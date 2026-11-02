@@ -59,11 +59,18 @@ jobs:
       - run: staticcheck -checks all ./...
 
   e2e:
+    name: e2e (${{ matrix.start_mode }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        start_mode: [two_phase, in_tx]
     steps:
       - uses: actions/checkout@v5
       - name: validate Prometheus config and alert rules
         run: make check-alerts
       - name: build the image and run the end-to-end script with docker compose
         run: ./scripts/e2e.sh
+        env:
+          START_MODE: ${{ matrix.start_mode }}

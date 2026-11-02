@@ -7,6 +7,7 @@
 # webhooks, and the decline / confirmation / cancel outcomes.
 #
 # Requires docker compose, curl and jq. KEEP=1 leaves the stack running.
+# START_MODE=two_phase (default) or in_tx selects the v2 or the v1 start.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,6 +16,13 @@ ADMIN=${ADMIN:-http://localhost:9100}
 PROM=${PROM:-http://localhost:9091}
 GW=${GW:-http://localhost:9090}
 KEEP=${KEEP:-0}
+START_MODE=${START_MODE:-two_phase}
+case $START_MODE in two_phase | in_tx) ;; *)
+  echo "START_MODE must be two_phase or in_tx" >&2
+  exit 2
+  ;;
+esac
+export PAYMENTS_START_MODE=$START_MODE
 
 pass=0
 log() { printf '%s\n' "$*" >&2; }
@@ -35,6 +43,10 @@ cleanup() {
 trap cleanup EXIT
 
 sql() { docker compose exec -T postgres psql -U payments -d payments -tAc "$1"; }
+
+# attempts_of ID -> the states of the payment's gateway attempts, in order
+attempts_of() { sql "SELECT coalesce(string_agg(state, ',' ORDER BY attempt), '') FROM gateway_attempts WHERE payment_id='$1'"; }
+two_phase() { [ "$START_MODE" = two_phase ]; }
 
 # create KEY AMOUNT -> prints "HTTP_CODE BODY"
 create() {
@@ -89,6 +101,8 @@ log "==> starting the stack"
 # Both services run the same image: build it once, then start everything.
 docker compose build payments
 docker compose up -d --wait
+docker compose logs payments | grep -q "\"start_mode\":\"$START_MODE\"" || fail "payments did not start in $START_MODE mode"
+ok "running with PAYMENTS_START_MODE=$START_MODE"
 
 log "==> service and web UI"
 expect "readyz on the admin port" "$(curl -sS -o /dev/null -w '%{http_code}' "$ADMIN/readyz")" 200
@@ -110,6 +124,12 @@ expect "replay returns the same payment" "$(jq -r .id <<<"${out#* }")" "$id"
 out=$(create e2e-key-1 9999)
 expect "same key, different body" "${out%% *}" 422
 expect "happy path" "$(follow "$id")" succeeded
+if two_phase; then
+  expect "one gateway attempt, done" "$(attempts_of "$id")" done
+  expect "attempt key is <payment id>:1" "$(sql "SELECT idempotency_key FROM gateway_attempts WHERE payment_id='$id'")" "$id:1"
+else
+  expect "v1 records no attempts" "$(attempts_of "$id")" ""
+fi
 expect "payments_created_total grew by one, replays not counted" "$(metric payments_created_total)" "$((created_before + 1))"
 at_least "transition to succeeded counted" "$(metric 'payment_transitions_total{from="processing",to="succeeded"}')" 1
 
@@ -120,27 +140,48 @@ id=$(new_payment 2000)
 expect "payment after rate limiting" "$(follow "$id")" succeeded
 expect "429 answers served" "$(($(gw_stat fault_429) - before))" 2
 
-log "==> gateway answers 500 (ambiguous): task retried with the same key"
+log "==> gateway answers 500 (ambiguous)"
 gw_control "faults=500"
 id=$(new_payment 2100)
 expect "payment after a 500" "$(follow "$id")" succeeded
-expect "start task needed a second attempt" "$(sql "SELECT attempts FROM tasks WHERE kind='start_payment' AND payment_id='$id'")" 1
+if two_phase; then
+  # Reconciliation finds nothing at the gateway, abandons attempt 1 and
+  # starts attempt 2 with a new key.
+  expect "attempt 1 abandoned, attempt 2 done" "$(attempts_of "$id")" "abandoned,done"
+else
+  expect "start task retried with the same key" "$(sql "SELECT attempts FROM tasks WHERE kind='start_payment' AND payment_id='$id'")" 1
+fi
+expect "the client was charged once after a 500" "$(curl -sS "$GW/v1/payments?reference=$id" | jq length)" 1
 
 log "==> gateway answers 409 (same key in progress), then 401 (bad credentials)"
 gw_control "faults=409,401"
 id=$(new_payment 2150)
 expect "payment after 409 and 401 is not failed" "$(follow "$id")" succeeded
-expect "start task needed two retries" "$(sql "SELECT attempts FROM tasks WHERE kind='start_payment' AND payment_id='$id'")" 2
+if two_phase; then
+  expect "409 attempt abandoned, next attempt done" "$(attempts_of "$id")" "abandoned,done"
+else
+  expect "start task needed two retries" "$(sql "SELECT attempts FROM tasks WHERE kind='start_payment' AND payment_id='$id'")" 2
+fi
 
 log "==> gateway executes the payment, then hangs (ambiguous outcome)"
 gw_control "faults=hang"
 before=$(gw_stat fault_hang)
+executions_before=$(gw_stat executions)
 id=$(new_payment 2200)
 expect "payment after a hung call" "$(follow "$id")" succeeded
 expect "the hung call happened" "$(($(gw_stat fault_hang) - before))" 1
-# Whether the retry or the webhook finished the payment depends on timing;
-# either way the client must have been charged exactly once.
+# Whichever path finished the payment (webhook, retry or reconciliation),
+# the gateway must have executed it exactly once.
+expect "exactly one gateway execution" "$(($(gw_stat executions) - executions_before))" 1
 expect "the client was charged once" "$(curl -sS "$GW/v1/payments?reference=$id" | jq length)" 1
+if two_phase; then
+  deadline=$((SECONDS + 30))
+  until [ "$(attempts_of "$id")" = done ]; do
+    [ $SECONDS -lt $deadline ] || fail "the hung attempt was not reconciled: $(attempts_of "$id")"
+    sleep 1
+  done
+  ok "the hung attempt was reconciled to done"
+fi
 
 log "==> webhooks dropped: polling finishes the job"
 gw_control "webhook=drop"
@@ -180,7 +221,16 @@ at_least "replay 200 counted" "$(metric 'http_requests_total{code="200",method="
 at_least "conflict 422 counted" "$(metric 'http_requests_total{code="422",method="POST",route="/v1/payments"}')" 1
 at_least "long polls in their own histogram" "$(metric http_long_poll_duration_seconds_count)" 1
 at_least "start tasks succeeded" "$(metric 'task_attempts_total{kind="start_payment",outcome="ok"}')" 1
-at_least "start tasks retried" "$(metric 'task_attempts_total{kind="start_payment",outcome="retry"}')" 4
+if two_phase; then
+  # Ambiguous calls go to reconciliation; only the 401 is a task retry.
+  at_least "start tasks retried" "$(metric 'task_attempts_total{kind="start_payment",outcome="retry"}')" 1
+  at_least "reconcile found the hung payment" "$(metric 'reconcile_total{outcome="found"}')" 1
+  at_least "reconcile abandoned the unexecuted attempts" "$(metric 'reconcile_total{outcome="abandoned"}')" 2
+  expect "no attempt left open" "$(metric 'gateway_attempts{state="unknown"}')" 0
+  expect "no open attempt age" "$(metric gateway_attempt_oldest_open_seconds)" 0
+else
+  at_least "start tasks retried" "$(metric 'task_attempts_total{kind="start_payment",outcome="retry"}')" 4
+fi
 at_least "gateway creates ok" "$(metric 'gateway_requests_total{op="create",outcome="ok"}')" 1
 at_least "gateway 429 counted" "$(metric 'gateway_requests_total{op="create",outcome="rate_limited"}')" 2
 at_least "gateway 401 counted as misconfigured" "$(metric 'gateway_requests_total{op="create",outcome="misconfigured"}')" 1

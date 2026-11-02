@@ -209,6 +209,24 @@ func TestWebhookModes(t *testing.T) {
 	})
 }
 
+// Latency delays the answer, not the execution: the payment exists, and its
+// first webhook can arrive, before the caller hears back.
+func TestLatencyDelaysTheAnswerAfterExecuting(t *testing.T) {
+	gw, srv := newTestGateway(t, "http://127.0.0.1:1/unused")
+	gw.mu.Lock()
+	gw.latency = time.Hour
+	gw.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	if _, _, err := create(t, ctx, srv.URL, "k1", 1250); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want a client timeout", err)
+	}
+	if st := gw.control().Stats; st["executions"] != 1 {
+		t.Fatalf("stats = %v, want the payment executed despite the slow answer", st)
+	}
+}
+
 func TestReadPayment(t *testing.T) {
 	_, srv := newTestGateway(t, "http://127.0.0.1:1/unused")
 	_, rec, _ := create(t, context.Background(), srv.URL, "k", 1250)

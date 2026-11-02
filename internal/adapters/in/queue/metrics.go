@@ -45,7 +45,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "task_duration_seconds",
 			Help:    "Run time of a task handler, including waits for row locks and gateway calls.",
-			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2.5, 5, 10, 30},
 		}, []string{"kind"}),
 		leaseLost: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lease_lost_total",

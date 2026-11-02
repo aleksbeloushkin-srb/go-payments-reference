@@ -115,8 +115,8 @@ func LoadConfig(environ []string) (Config, error) {
 		DBStatementTimeout: l.duration("DB_STATEMENT_TIMEOUT", 10*time.Second),
 		// Lock waiters fail fast and come back through task retries.
 		DBLockTimeout: l.duration("DB_LOCK_TIMEOUT", 5*time.Second),
-		// Longer than a task, because v1 idles in a transaction while it
-		// calls the gateway.
+		// Longer than a task, because the in_tx start idles in a transaction
+		// while it calls the gateway.
 		DBIdleInTxTimeout: l.duration("DB_IDLE_IN_TX_TIMEOUT", 45*time.Second),
 
 		GatewayURL: l.str("GATEWAY_URL", ""),
@@ -128,8 +128,8 @@ func LoadConfig(environ []string) (Config, error) {
 		GatewayMaxRetryAfter: l.duration("GATEWAY_MAX_RETRY_AFTER", 5*time.Second),
 		WebhookSecret:        l.str("WEBHOOK_SECRET", ""),
 
-		// v1 holds a connection during each gateway call, so keep this well
-		// below DB_MAX_CONNS.
+		// The in_tx start holds a connection during each gateway call, so
+		// this stays well below DB_MAX_CONNS.
 		WorkerConcurrency: l.integer("WORKER_CONCURRENCY", 4),
 		// Commit hooks wake the local worker; this only bounds the delay for
 		// tasks created by other instances.
@@ -237,7 +237,7 @@ func (c Config) validate() error {
 	check(gatewayBudget <= c.TaskTimeout,
 		"%sTASK_TIMEOUT (%s) must cover the worst gateway budget (%s)", envPrefix, c.TaskTimeout, gatewayBudget)
 	check(c.DBIdleInTxTimeout > c.TaskTimeout,
-		"%sDB_IDLE_IN_TX_TIMEOUT must exceed TASK_TIMEOUT: StartPayment idles in a transaction during the gateway call", envPrefix)
+		"%sDB_IDLE_IN_TX_TIMEOUT must exceed TASK_TIMEOUT: the in_tx start idles in a transaction during the gateway call", envPrefix)
 	check(c.RelayLease >= 2*c.EventsWebhookTimeout,
 		"%sRELAY_LEASE must be at least twice EVENTS_WEBHOOK_TIMEOUT, or the relay publishes almost nothing per batch", envPrefix)
 	check(c.WorkerConcurrency+3 <= c.DBMaxConns,

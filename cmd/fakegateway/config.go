@@ -21,7 +21,8 @@ type config struct {
 	// SettleDelay is the pause before each status change, long enough to see
 	// "processing" in the UI.
 	SettleDelay time.Duration
-	// Latency is added to every create call.
+	// Latency delays the answer to every create call, after the payment is
+	// executed.
 	Latency time.Duration
 	// RetryAfter is sent with injected 429 answers.
 	RetryAfter time.Duration
