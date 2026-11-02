@@ -29,7 +29,9 @@ jobs:
           go vet ./...
           go vet -tags integration ./...
       - name: test
-        run: go test -race -count=1 ./...
+        run: |
+          set -o pipefail
+          go test -race -count=1 -json ./... | go run ./scripts/testreport
 
   integration:
     name: integration (Go ${{ matrix.go }})
@@ -45,7 +47,9 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
       - name: integration tests (testcontainers PostgreSQL)
-        run: go test -race -count=1 -tags integration ./...
+        run: |
+          set -o pipefail
+          go test -race -count=1 -tags integration -json ./... | go run ./scripts/testreport
 
   staticcheck:
     runs-on: ubuntu-latest
