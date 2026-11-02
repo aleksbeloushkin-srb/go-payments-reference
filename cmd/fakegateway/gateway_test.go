@@ -46,6 +46,17 @@ func receiver(t *testing.T) (*httptest.Server, chan delivery) {
 	return srv, got
 }
 
+// quiesce stops new background work and waits for the running settle
+// goroutines to finish, without cancelling them. close cancels first, so a
+// settle that has not reached its first step yet would exit and count
+// nothing; tests that assert on settle results must wait with quiesce.
+func (g *gateway) quiesce() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+	g.wg.Wait()
+}
+
 func newTestGateway(t *testing.T, webhookURL string, faults ...string) (*gateway, *httptest.Server) {
 	t.Helper()
 	cfg := config{WebhookURL: webhookURL, WebhookSecret: testSecret, WebhookMode: "normal", RetryAfter: time.Second, Faults: faults}
@@ -216,7 +227,7 @@ func TestWebhookModes(t *testing.T) {
 		resp.Body.Close()
 
 		_, _, _ = create(t, context.Background(), srv.URL, "k", 1250)
-		gw.close() // waits until settling has finished
+		gw.quiesce() // lets settling finish; close would cancel it first
 		if len(got) != 0 || gw.control().Stats["webhooks_dropped"] != 1 {
 			t.Fatalf("deliveries = %d, stats = %v", len(got), gw.control().Stats)
 		}
