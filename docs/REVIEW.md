@@ -109,6 +109,8 @@ These were found and deliberately left as they are.
 
 ### W1. Gateway call inside the transaction, under a row lock (High, deliberate)
 
+How to remove it: [proposal 0001](proposals/0001-gateway-call-outside-transaction.md).
+
 `StartPayment` opens a transaction ([start.go:27](../internal/app/start.go#L27)),
 locks the payment row ([start.go:28](../internal/app/start.go#L28)), calls the
 gateway ([start.go:42](../internal/app/start.go#L42)) and commits only after

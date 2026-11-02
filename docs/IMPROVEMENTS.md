@@ -24,6 +24,8 @@ outcomes are handled, which several later items build on.
 
 ## 1. Gateway call outside the transaction, with a recorded intent
 
+Full design: [proposal 0001](proposals/0001-gateway-call-outside-transaction.md) — options, crash-point table, concurrency, tests and rollout.
+
 Today `StartPayment` locks the payment row, calls the gateway and commits,
 all in one transaction (`internal/app/start.go`). Version 2 breaks it into
 two short transactions around the call, and records what it is about to do
