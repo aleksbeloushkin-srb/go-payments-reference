@@ -155,12 +155,25 @@ func (c *clock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-// fakeGateway answers every create with a configurable result.
+// fakeGateway answers every create with a configurable result and
+// remembers the idempotency keys it executed, like a gateway that
+// deduplicates.
 type fakeGateway struct {
 	mu      sync.Mutex
 	create  ports.GatewayPayment
 	err     error
 	creates int
+	keys    map[string]bool
+	// during runs inside CreatePayment, after the payment is executed and
+	// before the answer: a slow gateway, a webhook racing the answer.
+	during func(ctx context.Context)
+}
+
+// executions is the number of distinct payments the gateway created.
+func (g *fakeGateway) executions() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.keys)
 }
 
 func (g *fakeGateway) set(res ports.GatewayPayment, err error) {
@@ -169,11 +182,21 @@ func (g *fakeGateway) set(res ports.GatewayPayment, err error) {
 	g.create, g.err = res, err
 }
 
-func (g *fakeGateway) CreatePayment(context.Context, ports.GatewayRequest) (ports.GatewayPayment, error) {
+func (g *fakeGateway) CreatePayment(ctx context.Context, req ports.GatewayRequest) (ports.GatewayPayment, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.creates++
-	return g.create, g.err
+	if g.err == nil {
+		if g.keys == nil {
+			g.keys = map[string]bool{}
+		}
+		g.keys[req.IdempotencyKey] = true
+	}
+	res, err, during := g.create, g.err, g.during
+	g.mu.Unlock()
+	if during != nil {
+		during(ctx)
+	}
+	return res, err
 }
 
 func (g *fakeGateway) FindByReference(context.Context, string) ([]ports.GatewayPayment, error) {
