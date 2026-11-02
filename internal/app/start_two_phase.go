@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -24,9 +25,12 @@ import (
 //     the answer and closes the attempt.
 //
 // An ambiguous answer marks the attempt unknown and hands it to
-// reconciliation instead of guessing. Whatever crashes where, the stored
-// attempt says what to check next, so a client is never charged twice as
-// long as the gateway deduplicates by key or can be searched by reference.
+// reconciliation instead of guessing; an answer saying that the request is
+// still in progress keeps the attempt and its key for a later retry.
+// Whatever crashes where, the stored attempt says what to check next. The
+// gateway must both deduplicate by idempotency key (a reused intent is sent
+// again) and support lookup by reference (ambiguous answers are settled by
+// lookup); see docs/EXTENDING.md.
 func (s *Service) startTwoPhase(ctx context.Context, id uuid.UUID) error {
 	attempt, p, call, err := s.beginAttempt(ctx, id)
 	if err != nil || !call {
@@ -41,10 +45,16 @@ func (s *Service) startTwoPhase(ctx context.Context, id uuid.UUID) error {
 	})
 	switch {
 	case err == nil:
-		return s.finishAttempt(ctx, attempt, res.Status, res.Ref)
+		_, err := s.finishAttempt(ctx, attempt, res.Status, res.Ref)
+		return err
 	case errors.Is(err, ports.ErrGatewayRejected):
 		s.log.WarnContext(ctx, "gateway rejected payment", "payment", p, "err", err)
-		return s.finishAttempt(ctx, attempt, payment.StatusFailed, "")
+		_, err := s.finishAttempt(ctx, attempt, payment.StatusFailed, "")
+		return err
+	case errors.Is(err, ports.ErrGatewayInProgress):
+		// The gateway knows this key and is still working on it: the attempt
+		// stays an intent and the task retries later with the same key.
+		return fmt.Errorf("create payment at gateway: %w", err)
 	case errors.Is(err, ports.ErrGatewayAmbiguous):
 		return s.markUnknown(ctx, attempt, err)
 	default:
@@ -72,7 +82,11 @@ func (s *Service) beginAttempt(ctx context.Context, id uuid.UUID) (attempt ports
 			return fmt.Errorf("lock payment: %w", err)
 		}
 		if p.Status != payment.StatusPending {
-			// Started already, or a gateway event got here first.
+			// Started already, or a gateway event got here first, possibly
+			// after a crash that left this payment's attempt open.
+			if err := s.settleOpenAttempt(ctx, p); err != nil {
+				return err
+			}
 			return s.ensurePoll(ctx, p)
 		}
 		open, ok, err := s.attempts.Open(ctx, id)
@@ -90,8 +104,7 @@ func (s *Service) beginAttempt(ctx context.Context, id uuid.UUID) (attempt ports
 			// under a new key.
 			attempt = open
 		default:
-			attempt, err = s.attempts.Create(ctx, id, s.clock.Now())
-			if err != nil {
+			if attempt, err = s.createAttempt(ctx, p); err != nil {
 				return err
 			}
 		}
@@ -101,13 +114,29 @@ func (s *Service) beginAttempt(ctx context.Context, id uuid.UUID) (attempt ports
 	return attempt, p, call, err
 }
 
+// createAttempt records the payment's next attempt, unless the cap on
+// attempts per payment is reached.
+func (s *Service) createAttempt(ctx context.Context, p payment.Payment) (ports.Attempt, error) {
+	last, ok, err := s.attempts.Latest(ctx, p.ID)
+	if err != nil {
+		return ports.Attempt{}, err
+	}
+	if ok && last.Number >= s.cfg.MaxGatewayAttempts {
+		s.log.ErrorContext(ctx, "gateway attempts exhausted; the payment needs an operator",
+			"payment", p, "attempts", last.Number)
+		return ports.Attempt{}, ports.Permanent(fmt.Errorf("payment %s: %d gateway attempts used, the cap", p.ID, last.Number))
+	}
+	return s.attempts.Create(ctx, p.ID, s.clock.Now())
+}
+
 // finishAttempt is tx2: apply the gateway's answer if the attempt is still
-// open. A worker that lost its lease and finishes late finds the attempt
-// closed and changes nothing; a gateway event that arrived during the call
-// has already moved the payment, and a stale answer does not move it back.
-func (s *Service) finishAttempt(ctx context.Context, a ports.Attempt, status payment.Status, ref string) error {
+// open. It reports whether the answer was applied. A worker that lost its
+// lease and finishes late finds the attempt closed and changes nothing; a
+// gateway event that arrived during the call has already moved the payment
+// and closed the attempt.
+func (s *Service) finishAttempt(ctx context.Context, a ports.Attempt, status payment.Status, ref string) (applied bool, err error) {
 	var change *statusChange
-	err := s.tx.Run(ctx, func(ctx context.Context) error {
+	err = s.tx.Run(ctx, func(ctx context.Context) error {
 		p, err := s.payments.Lock(ctx, a.PaymentID)
 		if err != nil {
 			return fmt.Errorf("lock payment: %w", err)
@@ -116,29 +145,76 @@ func (s *Service) finishAttempt(ctx context.Context, a ports.Attempt, status pay
 		if err != nil {
 			return err
 		}
-		if !cur.State.Open() {
-			s.log.InfoContext(ctx, "gateway attempt already settled", "payment", p, "attempt", cur.Number, "state", cur.State)
+		switch cur.State {
+		case ports.AttemptAbandoned:
+			// The gateway executed a key we gave up on. If a later attempt
+			// executed too, the client was charged twice: check at once.
+			s.log.ErrorContext(ctx, "gateway executed an abandoned attempt; checking for a duplicate charge",
+				"payment", p, "attempt", cur.Number, "gateway_ref", ref)
+			return s.ensureDuplicateCheck(ctx, cur, 0)
+		case ports.AttemptDone:
+			s.log.InfoContext(ctx, "gateway attempt already settled", "payment", p, "attempt", cur.Number)
 			return nil
 		}
 		if change, err = s.applyLocked(ctx, &p, status, ref); err != nil {
 			return err
 		}
-		from := cur.State
-		cur.State, cur.UpdatedAt = ports.AttemptDone, s.clock.Now()
-		if ref != "" {
-			cur.GatewayRef = ref
-		}
-		return s.attempts.Update(ctx, cur, from)
+		applied = true
+		return s.closeAttempt(ctx, cur, ref)
 	})
 	if err == nil {
 		s.report(change)
 	}
-	return err
+	return applied, err
+}
+
+// closeAttempt marks an open attempt done. An attempt that follows an
+// abandoned one gets a delayed duplicate check: the abandoned key may still
+// have executed at the gateway.
+func (s *Service) closeAttempt(ctx context.Context, a ports.Attempt, ref string) error {
+	from := a.State
+	a.State, a.UpdatedAt = ports.AttemptDone, s.clock.Now()
+	if ref != "" {
+		a.GatewayRef = ref
+	}
+	if err := s.attempts.Update(ctx, a, from); err != nil {
+		return err
+	}
+	if a.Number > 1 {
+		return s.ensureDuplicateCheck(ctx, a, s.cfg.DuplicateCheckDelay)
+	}
+	return nil
+}
+
+// settleOpenAttempt closes the open attempt of a payment that has left
+// pending. With a gateway reference the payment is known to the gateway, so
+// the attempt is done; without one, reconciliation finds out. Without this,
+// an attempt left open by a crash after the call would stay open forever
+// once a gateway event moved the payment.
+func (s *Service) settleOpenAttempt(ctx context.Context, p payment.Payment) error {
+	if p.Status == payment.StatusPending {
+		return nil
+	}
+	open, ok, err := s.attempts.Open(ctx, p.ID)
+	if err != nil || !ok {
+		return err
+	}
+	if p.GatewayRef != "" {
+		return s.closeAttempt(ctx, open, p.GatewayRef)
+	}
+	if open.State == ports.AttemptIntent {
+		open.State, open.UpdatedAt = ports.AttemptUnknown, s.clock.Now()
+		if err := s.attempts.Update(ctx, open, ports.AttemptIntent); err != nil {
+			return err
+		}
+	}
+	return s.ensureReconcile(ctx, open)
 }
 
 // markUnknown records an ambiguous call and schedules reconciliation. The
 // payment stays pending: nothing promises progress that may not exist.
 func (s *Service) markUnknown(ctx context.Context, a ports.Attempt, cause error) error {
+	marked := false
 	err := s.tx.Run(ctx, func(ctx context.Context) error {
 		if _, err := s.payments.Lock(ctx, a.PaymentID); err != nil {
 			return fmt.Errorf("lock payment: %w", err)
@@ -147,45 +223,66 @@ func (s *Service) markUnknown(ctx context.Context, a ports.Attempt, cause error)
 		if err != nil {
 			return err
 		}
-		if cur.State == ports.AttemptIntent {
-			cur.State, cur.UpdatedAt = ports.AttemptUnknown, s.clock.Now()
-			if err := s.attempts.Update(ctx, cur, ports.AttemptIntent); err != nil {
-				return err
-			}
+		if cur.State != ports.AttemptIntent {
+			return nil // settled meanwhile by another worker or a gateway event
 		}
-		if !cur.State.Open() {
-			return nil
+		cur.State, cur.UpdatedAt = ports.AttemptUnknown, s.clock.Now()
+		if err := s.attempts.Update(ctx, cur, ports.AttemptIntent); err != nil {
+			return err
 		}
+		marked = true
 		return s.ensureReconcile(ctx, cur)
 	})
-	if err == nil {
+	if err == nil && marked {
 		s.log.WarnContext(ctx, "gateway outcome unknown; reconciling", "payment_id", a.PaymentID,
 			"attempt", a.Number, "err", cause)
 	}
 	return err
 }
 
-// reconcilePayload is the payload of a reconcile_payment task.
-type reconcilePayload struct {
+// attemptPayload is the payload of reconcile_payment and check_duplicates
+// tasks.
+type attemptPayload struct {
 	Attempt int `json:"attempt"`
+}
+
+func decodeAttemptPayload(payload json.RawMessage) (int, error) {
+	var in attemptPayload
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return 0, ports.Permanent(fmt.Errorf("decode attempt payload: %w", err))
+	}
+	if in.Attempt < 1 {
+		return 0, ports.Permanent(fmt.Errorf("attempt payload %s: attempt must be at least 1", payload))
+	}
+	return in.Attempt, nil
 }
 
 // ensureReconcile schedules the reconcile task of an attempt; the dedup key
 // makes it idempotent.
 func (s *Service) ensureReconcile(ctx context.Context, a ports.Attempt) error {
-	payload, err := json.Marshal(reconcilePayload{Attempt: a.Number})
+	return s.enqueueForAttempt(ctx, ports.TaskReconcilePayment, "reconcile", a, s.cfg.ReconcileInterval)
+}
+
+// ensureDuplicateCheck schedules the duplicate check of an attempt after
+// delay; the dedup key makes it idempotent.
+func (s *Service) ensureDuplicateCheck(ctx context.Context, a ports.Attempt, delay time.Duration) error {
+	return s.enqueueForAttempt(ctx, ports.TaskCheckDuplicates, "duplicates", a, delay)
+}
+
+func (s *Service) enqueueForAttempt(ctx context.Context, kind ports.TaskKind, prefix string, a ports.Attempt, delay time.Duration) error {
+	payload, err := json.Marshal(attemptPayload{Attempt: a.Number})
 	if err != nil {
-		return fmt.Errorf("encode reconcile payload: %w", err)
+		return fmt.Errorf("encode %s payload: %w", kind, err)
 	}
 	task := ports.TaskSpec{
-		Kind:      ports.TaskReconcilePayment,
+		Kind:      kind,
 		PaymentID: a.PaymentID,
-		DedupKey:  fmt.Sprintf("reconcile:%d", a.Number),
+		DedupKey:  fmt.Sprintf("%s:%d", prefix, a.Number),
 		Payload:   payload,
-		RunAfter:  s.clock.Now().Add(s.cfg.ReconcileInterval),
+		RunAfter:  s.clock.Now().Add(delay),
 	}
 	if _, err := s.tasks.Enqueue(ctx, task); err != nil {
-		return fmt.Errorf("enqueue reconcile task: %w", err)
+		return fmt.Errorf("enqueue %s task: %w", kind, err)
 	}
 	return nil
 }

@@ -148,6 +148,8 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 		StartMode:              app.StartMode(cfg.StartMode),
 		ReconcileInterval:      cfg.ReconcileInterval,
 		ReconcileNotFoundLimit: cfg.ReconcileNotFoundLimit,
+		MaxGatewayAttempts:     cfg.MaxGatewayAttempts,
+		DuplicateCheckDelay:    cfg.DuplicateCheckDelay,
 		PollInterval:           cfg.PollInterval,
 		PollTimeout:            cfg.PollTimeout,
 		WaitTimeout:            cfg.WaitTimeout,

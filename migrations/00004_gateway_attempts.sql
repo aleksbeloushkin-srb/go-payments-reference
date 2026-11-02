@@ -22,10 +22,12 @@ CREATE TABLE gateway_attempts (
 CREATE UNIQUE INDEX gateway_attempts_one_open_idx ON gateway_attempts (payment_id)
     WHERE state IN ('intent', 'unknown');
 
--- The metrics collector counts attempts that are not done and the age of
--- the oldest open one on every scrape.
-CREATE INDEX gateway_attempts_not_done_idx ON gateway_attempts (state, created_at)
-    WHERE state <> 'done';
+-- The metrics collector counts open attempts and the age of the oldest one
+-- on every scrape. Done and abandoned attempts are terminal and only grow,
+-- so they are kept out of the index; abandons are counted by
+-- reconcile_total.
+CREATE INDEX gateway_attempts_open_age_idx ON gateway_attempts (created_at)
+    WHERE state IN ('intent', 'unknown');
 
 -- +goose Down
 DROP TABLE gateway_attempts;

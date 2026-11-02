@@ -106,6 +106,18 @@ func (m memAttempts) Get(_ context.Context, id uuid.UUID, n int) (ports.Attempt,
 	return a, nil
 }
 
+func (m memAttempts) Latest(_ context.Context, id uuid.UUID) (ports.Attempt, bool, error) {
+	m.s.mu.Lock()
+	defer m.s.mu.Unlock()
+	var latest ports.Attempt
+	for k, a := range m.s.attempts {
+		if k.payment == id && k.number > latest.Number {
+			latest = a
+		}
+	}
+	return latest, latest.Number > 0, nil
+}
+
 func (m memAttempts) Create(_ context.Context, id uuid.UUID, now time.Time) (ports.Attempt, error) {
 	m.s.mu.Lock()
 	defer m.s.mu.Unlock()
@@ -296,6 +308,7 @@ type fakeMetrics struct {
 	created    int
 	changes    []string
 	reconciled []string
+	duplicates int
 }
 
 func (m *fakeMetrics) PaymentCreated() {
@@ -308,6 +321,12 @@ func (m *fakeMetrics) StatusChanged(from, to payment.Status, _ time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.changes = append(m.changes, string(from)+"->"+string(to))
+}
+
+func (m *fakeMetrics) DuplicateDetected() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.duplicates++
 }
 
 func (m *fakeMetrics) Reconciled(outcome string) {
@@ -333,6 +352,8 @@ var testConfig = Config{
 	StartMode:              StartTwoPhase,
 	ReconcileInterval:      5 * time.Second,
 	ReconcileNotFoundLimit: 3,
+	MaxGatewayAttempts:     3,
+	DuplicateCheckDelay:    10 * time.Minute,
 	PollInterval:           3 * time.Second,
 	PollTimeout:            time.Hour,
 	WaitTimeout:            time.Minute,

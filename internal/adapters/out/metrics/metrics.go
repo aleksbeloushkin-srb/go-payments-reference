@@ -21,6 +21,7 @@ type Business struct {
 	transitions *prometheus.CounterVec
 	timeToFinal *prometheus.HistogramVec
 	reconciled  *prometheus.CounterVec
+	duplicates  prometheus.Counter
 }
 
 // reconcileOutcomes lists every value of the outcome label of
@@ -50,12 +51,21 @@ func NewBusiness(reg prometheus.Registerer) *Business {
 			Help: "Reconciliations of ambiguous gateway attempts by outcome: found, not_found, abandoned, duplicate, error.",
 		}, []string{"outcome"}),
 	}
-	reg.MustRegister(b.created, b.transitions, b.timeToFinal, b.reconciled)
+	b.duplicates = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_duplicates_detected_total",
+		Help: "Times the gateway was found holding more than one payment for one bank payment: a double charge to refund.",
+	})
+	reg.MustRegister(b.created, b.transitions, b.timeToFinal, b.reconciled, b.duplicates)
 	// Created at zero so increase() sees the first "duplicate" or "error".
 	for _, o := range reconcileOutcomes {
 		b.reconciled.WithLabelValues(o)
 	}
 	return b
+}
+
+// DuplicateDetected counts a detected double charge.
+func (b *Business) DuplicateDetected() {
+	b.duplicates.Inc()
 }
 
 // Reconciled counts one reconciliation outcome.

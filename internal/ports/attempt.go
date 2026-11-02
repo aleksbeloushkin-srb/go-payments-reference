@@ -49,7 +49,17 @@ type Attempt struct {
 
 // AttemptKey is the idempotency key of attempt n: stable while the attempt
 // is retried, different for a deliberate new attempt.
+//
+// Attempt 1 uses the payment id, the key the v1 (in_tx) start sends. A call
+// made by v1 that executed but never committed is therefore deduplicated by
+// the gateway when the two-phase start retries it as attempt 1, and the
+// reverse holds too: switching the start mode never sends a second key for
+// the same first call. Later attempts, which exist only after an attempt
+// was abandoned, use <payment id>:<n>.
 func AttemptKey(paymentID uuid.UUID, n int) string {
+	if n == 1 {
+		return paymentID.String()
+	}
 	return fmt.Sprintf("%s:%d", paymentID, n)
 }
 
@@ -61,6 +71,8 @@ type Attempts interface {
 	Open(ctx context.Context, paymentID uuid.UUID) (Attempt, bool, error)
 	// Get returns attempt number n of the payment.
 	Get(ctx context.Context, paymentID uuid.UUID, n int) (Attempt, error)
+	// Latest returns the payment's attempt with the highest number, if any.
+	Latest(ctx context.Context, paymentID uuid.UUID) (Attempt, bool, error)
 	// Create inserts the payment's next attempt in the intent state.
 	Create(ctx context.Context, paymentID uuid.UUID, now time.Time) (Attempt, error)
 	// Update writes the state, gateway reference, not-found count and

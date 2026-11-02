@@ -228,8 +228,8 @@ func TestTwoPhaseStartOutcomes(t *testing.T) {
 			if got := f.store.attemptStates(p.ID); !slices.Equal(got, []ports.AttemptState{tt.wantAttempt}) {
 				t.Fatalf("attempts = %v, want [%s]", got, tt.wantAttempt)
 			}
-			if key := f.gateway.creates[0].IdempotencyKey; key != p.ID.String()+":1" {
-				t.Fatalf("idempotency key = %q, want <payment id>:1", key)
+			if key := f.gateway.creates[0].IdempotencyKey; key != p.ID.String() {
+				t.Fatalf("idempotency key = %q, want the payment id: attempt 1 uses the v1 key", key)
 			}
 			if got := len(f.store.tasksOf(ports.TaskPollPayment)) == 1; got != tt.wantPoll {
 				t.Fatalf("poll task = %v, want %v", got, tt.wantPoll)
@@ -265,7 +265,7 @@ func TestTwoPhaseWebhookBetweenTx1AndTx2(t *testing.T) {
 	f, gw := newTwoPhaseFixture()
 	p := f.seed(payment.StatusPending)
 	gw.during = func() {
-		payload, _ := json.Marshal(GatewayEvent{ID: "evt_1", PaymentID: p.ID, GatewayRef: "gw_" + p.ID.String() + ":1", Status: payment.StatusSucceeded})
+		payload, _ := json.Marshal(GatewayEvent{ID: "evt_1", PaymentID: p.ID, GatewayRef: "gw_" + p.ID.String(), Status: payment.StatusSucceeded})
 		if err := f.svc.ApplyGatewayEvent(context.Background(), payload); err != nil {
 			t.Errorf("webhook during the call: %v", err)
 		}
@@ -332,7 +332,7 @@ func TestTwoPhaseUnknownAttemptBlocksNewCalls(t *testing.T) {
 
 func reconcile(t *testing.T, f *fixture, id uuid.UUID, attempt int) error {
 	t.Helper()
-	payload, _ := json.Marshal(reconcilePayload{Attempt: attempt})
+	payload, _ := json.Marshal(attemptPayload{Attempt: attempt})
 	return f.svc.ReconcilePayment(context.Background(), id, payload)
 }
 

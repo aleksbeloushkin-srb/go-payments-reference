@@ -14,7 +14,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/outbox"
-	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/domain/payment"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
@@ -40,7 +39,7 @@ type publisherFunc func(ctx context.Context, r ports.OutboxRecord) error
 func (f publisherFunc) Publish(ctx context.Context, r ports.OutboxRecord) error { return f(ctx, r) }
 
 func TestOutboxClaimLeaseAndMark(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	ctx := context.Background()
 	recordEvents(t, e, 3)
 	t0 := e.clock.Now()
@@ -79,7 +78,7 @@ func TestOutboxClaimLeaseAndMark(t *testing.T) {
 // A failed delivery marks what went out before it and releases the rest,
 // which the next batch publishes in order.
 func TestRelayFailureMarksOnlyPublishedEvents(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	recordEvents(t, e, 3)
 	var seen []int64
 	fail := true
@@ -110,7 +109,7 @@ func TestRelayFailureMarksOnlyPublishedEvents(t *testing.T) {
 // The relay holds no database connection while it publishes: a slow
 // subscriber cannot pin a connection or hit the idle-in-transaction limit.
 func TestRelayHoldsNoConnectionWhilePublishing(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	recordEvents(t, e, 2)
 	var acquired []int32
 	pub := publisherFunc(func(context.Context, ports.OutboxRecord) error {
@@ -129,7 +128,7 @@ func TestRelayHoldsNoConnectionWhilePublishing(t *testing.T) {
 // Two relays running at the same time claim disjoint batches, so no event
 // is published twice.
 func TestConcurrentRelaysPublishEachEventOnce(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	recordEvents(t, e, 6)
 
 	var mu sync.Mutex

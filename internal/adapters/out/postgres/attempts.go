@@ -121,3 +121,18 @@ func (s *Attempts) Update(ctx context.Context, a ports.Attempt, from ports.Attem
 	}
 	return nil
 }
+
+// Latest returns the payment's attempt with the highest number, if any.
+func (s *Attempts) Latest(ctx context.Context, paymentID uuid.UUID) (ports.Attempt, bool, error) {
+	row := s.tx.DB(ctx).QueryRow(ctx, `
+		SELECT `+attemptColumns+` FROM gateway_attempts
+		WHERE payment_id = $1 ORDER BY attempt DESC LIMIT 1`, paymentID)
+	a, err := scanAttempt(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ports.Attempt{}, false, nil
+	}
+	if err != nil {
+		return ports.Attempt{}, false, fmt.Errorf("select latest attempt: %w", err)
+	}
+	return a, true, nil
+}

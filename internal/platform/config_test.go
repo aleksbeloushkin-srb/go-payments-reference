@@ -53,6 +53,9 @@ func TestLoadConfigErrors(t *testing.T) {
 		{"admin on the api port", []string{"PAYMENTS_ADMIN_ADDR=:8080"}, "ADMIN_ADDR must differ from HTTP_ADDR"},
 		{"unknown start mode", []string{"PAYMENTS_START_MODE=eventually"}, `"eventually" is not one of [two_phase in_tx]`},
 		{"no reconcile lookups", []string{"PAYMENTS_RECONCILE_NOT_FOUND_LIMIT=0"}, "RECONCILE_NOT_FOUND_LIMIT must be at least 1"},
+		{"abandon window too short", []string{"PAYMENTS_RECONCILE_INTERVAL=2s"}, "RECONCILE_INTERVAL x RECONCILE_NOT_FOUND_LIMIT must cover"},
+		{"no gateway attempts", []string{"PAYMENTS_MAX_GATEWAY_ATTEMPTS=0"}, "MAX_GATEWAY_ATTEMPTS must be between 1 and 10"},
+		{"no margin after the gateway budget", []string{"PAYMENTS_TASK_TIMEOUT=25s", "PAYMENTS_TASK_LEASE=60s"}, "must exceed the worst gateway budget"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -103,11 +103,30 @@ func newEnv(t *testing.T, cfg app.Config) *env {
 		waiters:  longpoll.NewRegistry(100, longpoll.NewMetrics(prometheus.NewRegistry())),
 		clock:    &clock{now: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)},
 	}
-	if cfg == (app.Config{}) {
-		cfg = defaultConfig()
+	e.svc = newEnvService(e, cfg)
+	return e
+}
+
+// defaultConfig is the service configuration of most tests: the v2 start.
+func defaultConfig() app.Config {
+	return app.Config{
+		StartMode:              app.StartTwoPhase,
+		ReconcileInterval:      5 * time.Second,
+		ReconcileNotFoundLimit: 3,
+		MaxGatewayAttempts:     3,
+		DuplicateCheckDelay:    10 * time.Minute,
+		PollInterval:           3 * time.Second,
+		PollTimeout:            time.Hour,
+		WaitTimeout:            5 * time.Second,
+		WaitReadTimeout:        2 * time.Second,
 	}
-	e.svc = app.NewService(app.Deps{
-		Tx:       tx,
+}
+
+// newEnvService builds a service over e's stores and gateway with cfg; two
+// services with different configurations can share one environment.
+func newEnvService(e *env, cfg app.Config) *app.Service {
+	return app.NewService(app.Deps{
+		Tx:       e.tx,
 		Payments: e.payments,
 		Attempts: e.attempts,
 		Tasks:    e.tasks,
@@ -119,20 +138,13 @@ func newEnv(t *testing.T, cfg app.Config) *env {
 		NewID:    uuid.NewV7,
 		Logger:   discard(),
 	}, cfg)
-	return e
 }
 
-// defaultConfig is the service configuration of most tests: the v2 start.
-func defaultConfig() app.Config {
-	return app.Config{
-		StartMode:              app.StartTwoPhase,
-		ReconcileInterval:      5 * time.Second,
-		ReconcileNotFoundLimit: 3,
-		PollInterval:           3 * time.Second,
-		PollTimeout:            time.Hour,
-		WaitTimeout:            5 * time.Second,
-		WaitReadTimeout:        2 * time.Second,
-	}
+// waitConfig is defaultConfig with the given long-poll soft timeout.
+func waitConfig(wait time.Duration) app.Config {
+	cfg := defaultConfig()
+	cfg.PollInterval, cfg.WaitTimeout = time.Second, wait
+	return cfg
 }
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -167,6 +179,9 @@ type fakeGateway struct {
 	// during runs inside CreatePayment, after the payment is executed and
 	// before the answer: a slow gateway, a webhook racing the answer.
 	during func(ctx context.Context)
+	// lookup, when set, answers FindByReference instead of the create
+	// result.
+	lookup func() ([]ports.GatewayPayment, error)
 }
 
 // executions is the number of distinct payments the gateway created.
@@ -202,6 +217,9 @@ func (g *fakeGateway) CreatePayment(ctx context.Context, req ports.GatewayReques
 func (g *fakeGateway) FindByReference(context.Context, string) ([]ports.GatewayPayment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.lookup != nil {
+		return g.lookup()
+	}
 	if g.err != nil {
 		return nil, g.err
 	}

@@ -11,7 +11,6 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/out/postgres"
-	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
 )
 
 // gather collects reg into "name{label=value}" -> value.
@@ -47,7 +46,7 @@ func value(m *dto.Metric) float64 {
 // The queue collector's SQL against a real schema: counts by state and kind,
 // and the ages of the oldest due task and the oldest unpublished event.
 func TestQueueCollector(t *testing.T) {
-	newEnv(t, app.Config{}) // empties the tables
+	newEnv(t, defaultConfig()) // empties the tables
 	ctx := context.Background()
 	exec := func(sql string) {
 		t.Helper()
@@ -81,7 +80,6 @@ func TestQueueCollector(t *testing.T) {
 		"tasks_dead{kind=start_payment}":        0,
 		"metrics_collect_errors_total":          0,
 		"gateway_attempts{state=unknown}":       1,
-		"gateway_attempts{state=abandoned}":     1,
 		"gateway_attempts{state=intent}":        0,
 	} {
 		if got[key] != want {
@@ -93,6 +91,9 @@ func TestQueueCollector(t *testing.T) {
 	}
 	if age := got["outbox_oldest_unpublished_seconds"]; age < 90 || age > 120 {
 		t.Errorf("outbox_oldest_unpublished_seconds = %v, want about 90", age)
+	}
+	if _, ok := got["gateway_attempts{state=abandoned}"]; ok {
+		t.Error("abandoned attempts are terminal and must not be a gauge")
 	}
 	if age := got["gateway_attempt_oldest_open_seconds"]; age < 40 || age > 70 {
 		t.Errorf("gateway_attempt_oldest_open_seconds = %v, want about 40 (the abandoned attempt does not count)", age)

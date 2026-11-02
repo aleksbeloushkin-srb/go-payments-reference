@@ -14,7 +14,7 @@ import (
 )
 
 func TestCreateIsIdempotent(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 
 	first := createPayment(t, e, "key-1", 1500)
 	replay := createPayment(t, e, "key-1", 1500)
@@ -43,7 +43,7 @@ func TestCreateIsIdempotent(t *testing.T) {
 // Concurrent requests with one key race on the unique index. Exactly one
 // inserts; the rest wait for it and return the same payment.
 func TestConcurrentCreatesWithOneKey(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	const n = 16
 	results := make([]app.CreatePaymentResult, n)
 	errs := make([]error, n)
@@ -110,7 +110,7 @@ func TestOutboxIsWrittenInTheSameTransaction(t *testing.T) {
 
 // A late or duplicate gateway event never moves a final payment.
 func TestStateMachineDoesNotRegress(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	ctx := context.Background()
 	p := createPayment(t, e, "key-1", 1500).Payment
 	e.gateway.set(ports.GatewayPayment{Ref: "gw_1", Status: payment.StatusProcessing}, nil)
@@ -144,7 +144,7 @@ func TestStateMachineDoesNotRegress(t *testing.T) {
 
 // Update refuses a stale version even when the caller forgot the lock.
 func TestUpdateChecksVersion(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	p := createPayment(t, e, "key-1", 1500).Payment
 	p.Status, p.Version = payment.StatusProcessing, 2
 

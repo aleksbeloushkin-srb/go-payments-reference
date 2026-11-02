@@ -68,6 +68,8 @@ type Config struct {
 	StartMode              string
 	ReconcileInterval      time.Duration
 	ReconcileNotFoundLimit int
+	MaxGatewayAttempts     int
+	DuplicateCheckDelay    time.Duration
 
 	WaitTimeout       time.Duration
 	WaitReadTimeout   time.Duration
@@ -152,11 +154,18 @@ func LoadConfig(environ []string) (Config, error) {
 		// two_phase calls the gateway with no transaction open (v2); in_tx
 		// is the v1 start, kept to compare the two.
 		StartMode: l.oneOf("START_MODE", "two_phase", "two_phase", "in_tx"),
-		// Lookups of an ambiguous attempt, spaced so a gateway that is slow
-		// to show a new payment gets 10 to 15 s before the attempt is
-		// abandoned after three certain "not found" answers.
-		ReconcileInterval:      l.duration("RECONCILE_INTERVAL", 5*time.Second),
+		// Lookups of an ambiguous attempt. Three certain "not found" answers
+		// 10 s apart give the gateway 30 s to show a payment before the
+		// attempt is abandoned: longer than the worst gateway budget, so a
+		// call of ours cannot still be in flight.
+		ReconcileInterval:      l.duration("RECONCILE_INTERVAL", 10*time.Second),
 		ReconcileNotFoundLimit: l.integer("RECONCILE_NOT_FOUND_LIMIT", 3),
+		// Each new attempt is another chance of a late double charge; three
+		// is enough to ride out a gateway glitch.
+		MaxGatewayAttempts: l.integer("MAX_GATEWAY_ATTEMPTS", 3),
+		// After an abandoned attempt, the gateway is asked again this much
+		// later whether it holds more than one payment for us.
+		DuplicateCheckDelay: l.duration("DUPLICATE_CHECK_DELAY", 10*time.Minute),
 
 		// Well under the 30 to 60 second idle timeouts common in proxies.
 		WaitTimeout: l.duration("WAIT_TIMEOUT", 15*time.Second),
@@ -207,7 +216,7 @@ func (c Config) validate() error {
 		"POLL_INTERVAL": c.PollInterval, "POLL_TIMEOUT": c.PollTimeout, "WAIT_TIMEOUT": c.WaitTimeout, "WAIT_READ_TIMEOUT": c.WaitReadTimeout,
 		"WAIT_BATCH_INTERVAL": c.WaitBatchInterval, "RELAY_INTERVAL": c.RelayInterval,
 		"RELAY_LEASE": c.RelayLease, "EVENTS_WEBHOOK_TIMEOUT": c.EventsWebhookTimeout,
-		"RECONCILE_INTERVAL": c.ReconcileInterval,
+		"RECONCILE_INTERVAL": c.ReconcileInterval, "DUPLICATE_CHECK_DELAY": c.DuplicateCheckDelay,
 	}
 	for _, name := range slices.Sorted(maps.Keys(durations)) {
 		// A zero timeout would mean "already expired" or "no limit"; neither
@@ -222,6 +231,7 @@ func (c Config) validate() error {
 	check(c.WaitMaxWaiters >= 1, "%sWAIT_MAX_WAITERS must be at least 1", envPrefix)
 	check(c.RelayBatch >= 1, "%sRELAY_BATCH must be at least 1", envPrefix)
 	check(c.ReconcileNotFoundLimit >= 1, "%sRECONCILE_NOT_FOUND_LIMIT must be at least 1", envPrefix)
+	check(c.MaxGatewayAttempts >= 1 && c.MaxGatewayAttempts <= 10, "%sMAX_GATEWAY_ATTEMPTS must be between 1 and 10", envPrefix)
 	check(c.DatabaseURL != "", "%sDATABASE_URL is required", envPrefix)
 	check(c.AdminAddr != "", "%sADMIN_ADDR is required", envPrefix)
 	check(!c.Roles.API || c.AdminAddr != c.HTTPAddr,
@@ -234,8 +244,12 @@ func (c Config) validate() error {
 	check(c.TaskTimeout+10*time.Second <= c.TaskLease,
 		"%sTASK_TIMEOUT must be at least 10s shorter than TASK_LEASE, or a slow task is claimed twice", envPrefix)
 	gatewayBudget := time.Duration(c.GatewayMaxRetries+1)*c.GatewayTimeout + time.Duration(c.GatewayMaxRetries)*c.GatewayMaxRetryAfter
-	check(gatewayBudget <= c.TaskTimeout,
-		"%sTASK_TIMEOUT (%s) must cover the worst gateway budget (%s)", envPrefix, c.TaskTimeout, gatewayBudget)
+	// The margin leaves time for tx2 or for marking the attempt unknown
+	// after the slowest call, before the task's deadline.
+	check(gatewayBudget+5*time.Second <= c.TaskTimeout,
+		"%sTASK_TIMEOUT (%s) must exceed the worst gateway budget (%s) by at least 5s", envPrefix, c.TaskTimeout, gatewayBudget)
+	check(time.Duration(c.ReconcileNotFoundLimit)*c.ReconcileInterval >= gatewayBudget,
+		"%sRECONCILE_INTERVAL x RECONCILE_NOT_FOUND_LIMIT must cover the worst gateway budget (%s): an attempt must not be abandoned while a call may be in flight", envPrefix, gatewayBudget)
 	check(c.DBIdleInTxTimeout > c.TaskTimeout,
 		"%sDB_IDLE_IN_TX_TIMEOUT must exceed TASK_TIMEOUT: the in_tx start idles in a transaction during the gateway call", envPrefix)
 	check(c.RelayLease >= 2*c.EventsWebhookTimeout,

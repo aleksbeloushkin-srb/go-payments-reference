@@ -14,7 +14,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/adapters/in/queue"
-	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
 
@@ -48,7 +47,7 @@ func enqueue(t *testing.T, e *env, n int) {
 // Eight workers drain the same table concurrently. SKIP LOCKED and the lease
 // guarantee that each task is handled exactly once.
 func TestConcurrentWorkersNeverDoubleProcess(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	const tasks, workers = 200, 8
 	enqueue(t, e, tasks)
 
@@ -97,7 +96,7 @@ func TestConcurrentWorkersNeverDoubleProcess(t *testing.T) {
 // A worker that dies keeps its lease until it expires; then another worker
 // re-claims the task, and the first worker can no longer settle it.
 func TestLeaseExpiryAllowsReclaim(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	ctx := context.Background()
 	enqueue(t, e, 1)
 	t0 := e.clock.Now()
@@ -125,7 +124,7 @@ func TestLeaseExpiryAllowsReclaim(t *testing.T) {
 // A task that keeps failing is retried with backoff and moves to the dead
 // state after MaxAttempts.
 func TestTaskGoesDeadAfterMaxAttempts(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	enqueue(t, e, 1)
 	var runs atomic.Int32
 	w := queue.NewWorker(e.tasks, handlerFunc(func(context.Context, ports.Task) error {
@@ -159,7 +158,7 @@ func TestTaskGoesDeadAfterMaxAttempts(t *testing.T) {
 
 // Polling postpones the same task without spending attempts.
 func TestRetryLaterKeepsAttempts(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	enqueue(t, e, 1)
 	w := queue.NewWorker(e.tasks, handlerFunc(func(context.Context, ports.Task) error {
 		return ports.RetryLater(5*time.Second, "processing")

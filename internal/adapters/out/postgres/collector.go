@@ -54,7 +54,7 @@ func NewQueueCollector(db txctx.Querier, timeout time.Duration, log *slog.Logger
 		oldestUnpublished: prometheus.NewDesc("outbox_oldest_unpublished_seconds",
 			"Age of the oldest unpublished outbox event; 0 when none.", nil, nil),
 		attempts: prometheus.NewDesc("gateway_attempts",
-			"Gateway attempts of the two-phase start by state; done attempts are not counted.", []string{"state"}, nil),
+			"Open gateway attempts of the two-phase start by state (intent, unknown).", []string{"state"}, nil),
 		oldestOpenAttempt: prometheus.NewDesc("gateway_attempt_oldest_open_seconds",
 			"Age of the oldest intent or unknown gateway attempt; 0 when none.", nil, nil),
 		errors: prometheus.NewCounter(prometheus.CounterOpts{
@@ -76,8 +76,9 @@ func (c *QueueCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 // queueStatsSQL returns one row per value: counts by kind for ready and dead
-// tasks, counts by state for gateway attempts, and three ages. Done
-// attempts only ever grow, so they are left out of the per-scrape count.
+// tasks, counts of open gateway attempts by state, and three ages. Done and
+// abandoned attempts are terminal and only grow, so they are not counted on
+// every scrape.
 const queueStatsSQL = `
 	SELECT 'ready' AS name, kind, count(*)::float8 AS value
 	FROM tasks WHERE state = 'ready' GROUP BY kind
@@ -92,7 +93,7 @@ const queueStatsSQL = `
 	FROM outbox WHERE published_at IS NULL
 	UNION ALL
 	SELECT 'attempts', state, count(*)::float8
-	FROM gateway_attempts WHERE state <> 'done' GROUP BY state
+	FROM gateway_attempts WHERE state IN ('intent', 'unknown') GROUP BY state
 	UNION ALL
 	SELECT 'oldest_open_attempt', '', greatest(coalesce(extract(epoch FROM now() - min(created_at))::float8, 0), 0)
 	FROM gateway_attempts WHERE state IN ('intent', 'unknown')`
@@ -131,8 +132,8 @@ func (c *QueueCollector) Collect(ch chan<- prometheus.Metric) {
 	for kind, n := range stats.dead {
 		ch <- prometheus.MustNewConstMetric(c.dead, prometheus.GaugeValue, n, kind)
 	}
-	for _, state := range []ports.AttemptState{ports.AttemptIntent, ports.AttemptUnknown, ports.AttemptAbandoned} {
-		if _, ok := stats.attempts[string(state)]; !ok {
+	for _, state := range ports.AttemptStates {
+		if _, ok := stats.attempts[string(state)]; state.Open() && !ok {
 			stats.attempts[string(state)] = 0
 		}
 	}

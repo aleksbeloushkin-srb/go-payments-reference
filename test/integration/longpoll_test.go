@@ -84,7 +84,7 @@ type pollResult struct {
 // Whether the request registers before or after the change, the answer is
 // the same: modified, with the new version.
 func TestLongPollWakesOnChange(t *testing.T) {
-	e := newEnv(t, app.Config{PollInterval: time.Second, PollTimeout: time.Hour, WaitTimeout: 10 * time.Second, WaitReadTimeout: 2 * time.Second})
+	e := newEnv(t, waitConfig(10*time.Second))
 	srv := startAPI(t, e)
 	p := createPayment(t, e, "key-1", 1500).Payment
 
@@ -108,7 +108,7 @@ func TestLongPollWakesOnChange(t *testing.T) {
 }
 
 func TestLongPollSoftTimeout(t *testing.T) {
-	e := newEnv(t, app.Config{PollInterval: time.Second, PollTimeout: time.Hour, WaitTimeout: 150 * time.Millisecond, WaitReadTimeout: 2 * time.Second})
+	e := newEnv(t, waitConfig(150*time.Millisecond))
 	srv := startAPI(t, e)
 	p := createPayment(t, e, "key-1", 1500).Payment
 
@@ -120,12 +120,12 @@ func TestLongPollSoftTimeout(t *testing.T) {
 }
 
 func TestLongPollRegistryFull(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	e.waiters = longpoll.NewRegistry(1, longpoll.NewMetrics(prometheus.NewRegistry()))
 	e.svc = app.NewService(app.Deps{
 		Tx: e.tx, Payments: e.payments, Attempts: e.attempts, Tasks: e.tasks, Events: e.outbox, Gateway: e.gateway,
 		Watcher: e.waiters, Clock: e.clock, Metrics: metrics.NewBusiness(prometheus.NewRegistry()), NewID: newV7, Logger: discard(),
-	}, app.Config{PollInterval: time.Second, PollTimeout: time.Hour, WaitTimeout: 10 * time.Second, WaitReadTimeout: 2 * time.Second})
+	}, waitConfig(10*time.Second))
 	srv := startAPI(t, e)
 	p := createPayment(t, e, "key-1", 1500).Payment
 

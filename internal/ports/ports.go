@@ -74,6 +74,9 @@ type Metrics interface {
 	// Reconciled reports how one reconciliation of an ambiguous gateway
 	// attempt ended: found, not_found, abandoned, duplicate or error.
 	Reconciled(outcome string)
+	// DuplicateDetected reports that the gateway holds more than one
+	// payment for one bank payment: the client was charged twice.
+	DuplicateDetected()
 }
 
 // Watcher lets a use case wait until a payment's version moves past a marker

@@ -7,14 +7,13 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/app"
 	"github.com/aleksbeloushkin-srb/go-payments-reference/internal/ports"
 )
 
 // The attempts store against the real schema: numbering, keys, the
 // one-open-attempt rule and the state check on update.
 func TestAttemptsStore(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	ctx := context.Background()
 	p := createPayment(t, e, "key-1", 1500).Payment
 	now := e.clock.Now()
@@ -27,7 +26,7 @@ func TestAttemptsStore(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if first.Number != 1 || first.IdempotencyKey != p.ID.String()+":1" || first.State != ports.AttemptIntent {
+		if first.Number != 1 || first.IdempotencyKey != p.ID.String() || first.State != ports.AttemptIntent {
 			t.Fatalf("first attempt = %+v", first)
 		}
 		open, ok, err := e.attempts.Open(ctx, p.ID)

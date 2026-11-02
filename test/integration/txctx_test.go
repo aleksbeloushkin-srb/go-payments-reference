@@ -27,7 +27,7 @@ func newPayment(t *testing.T, key string) payment.Payment {
 // A nested Run joins the outer transaction: an error anywhere rolls back
 // every write, and AfterCommit hooks run only after a real commit.
 func TestTransactionJoinRollbackAndHooks(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	ctx := context.Background()
 	hooks := 0
 
@@ -67,7 +67,7 @@ func TestTransactionJoinRollbackAndHooks(t *testing.T) {
 
 // The commit hook of Enqueue wakes the local worker only after commit.
 func TestEnqueueSignalsAfterCommit(t *testing.T) {
-	e := newEnv(t, app.Config{})
+	e := newEnv(t, defaultConfig())
 	_ = e.tx.Run(context.Background(), func(ctx context.Context) error {
 		createPaymentIn(t, ctx, e)
 		select {

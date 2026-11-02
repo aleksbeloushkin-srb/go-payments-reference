@@ -1,6 +1,8 @@
 package app
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -32,6 +34,14 @@ type Config struct {
 	// ReconcileNotFoundLimit is how many certain "not found" answers abandon
 	// an ambiguous attempt, so that a new one may be made.
 	ReconcileNotFoundLimit int
+	// MaxGatewayAttempts caps the attempts per payment. When the last one is
+	// abandoned, the payment stays pending and its task goes dead for an
+	// operator.
+	MaxGatewayAttempts int
+	// DuplicateCheckDelay is how long after an attempt that follows an
+	// abandoned one the gateway is asked again whether it holds more than one
+	// payment for our reference.
+	DuplicateCheckDelay time.Duration
 	// PollInterval is the delay between two gateway polls of a payment that
 	// is not final yet.
 	PollInterval time.Duration
@@ -79,9 +89,14 @@ type Service struct {
 	cfg      Config
 }
 
-// NewService returns a Service. It panics if a dependency is missing: that is
-// a wiring bug that must fail at start, not on the first request.
+// NewService returns a Service. It panics if a dependency is missing or the
+// configuration is invalid: that is a wiring bug that must fail at start,
+// not on the first request. platform.LoadConfig validates the environment;
+// this check also covers tests and other callers.
 func NewService(d Deps, cfg Config) *Service {
+	if err := cfg.validate(); err != nil {
+		panic("app: NewService: " + err.Error())
+	}
 	if d.Tx == nil || d.Payments == nil || d.Attempts == nil || d.Tasks == nil || d.Events == nil ||
 		d.Gateway == nil || d.Watcher == nil || d.Clock == nil || d.Metrics == nil || d.NewID == nil || d.Logger == nil {
 		panic("app: NewService: missing dependency")
@@ -100,4 +115,19 @@ func NewService(d Deps, cfg Config) *Service {
 		log:      d.Logger,
 		cfg:      cfg,
 	}
+}
+
+func (c Config) validate() error {
+	switch {
+	case c.StartMode != StartTwoPhase && c.StartMode != StartInTx:
+		return fmt.Errorf("unknown start mode %q", c.StartMode)
+	case c.ReconcileInterval <= 0, c.DuplicateCheckDelay <= 0, c.PollInterval <= 0, c.PollTimeout <= 0,
+		c.WaitTimeout <= 0, c.WaitReadTimeout <= 0:
+		return errors.New("every duration must be positive")
+	case c.ReconcileNotFoundLimit < 1:
+		return errors.New("ReconcileNotFoundLimit must be at least 1")
+	case c.MaxGatewayAttempts < 1:
+		return errors.New("MaxGatewayAttempts must be at least 1")
+	}
+	return nil
 }

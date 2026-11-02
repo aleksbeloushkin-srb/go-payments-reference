@@ -13,20 +13,38 @@ import (
 
 // StartPayment sends a pending payment to the gateway, in the configured
 // start mode.
+//
+// The two modes are safe to switch between on live data. Attempt 1 of the
+// two-phase start sends the v1 key (the payment id), so a v1 call that
+// executed without committing is deduplicated when two_phase retries it;
+// and a payment that has gateway attempts is always finished by the
+// two-phase start, even in in_tx mode, so an open attempt is never bypassed.
 func (s *Service) StartPayment(ctx context.Context, id uuid.UUID) error {
-	if s.cfg.StartMode == StartInTx {
-		return s.startInTx(ctx, id)
+	switch s.cfg.StartMode {
+	case StartInTx:
+		err := s.startInTx(ctx, id)
+		if !errors.Is(err, errHasAttempts) {
+			return err
+		}
+		return s.startTwoPhase(ctx, id)
+	case StartTwoPhase:
+		return s.startTwoPhase(ctx, id)
+	default:
+		return ports.Permanent(fmt.Errorf("unknown start mode %q", s.cfg.StartMode))
 	}
-	return s.startTwoPhase(ctx, id)
 }
+
+// errHasAttempts makes startInTx hand a payment to the two-phase start
+// because it already has gateway attempts.
+var errHasAttempts = errors.New("payment has gateway attempts")
 
 // startInTx is the version 1 start, kept for comparison
 // (PAYMENTS_START_MODE=in_tx).
 //
 // Version 1 uses this design on purpose, as a teaching example of the
 // trade-off: the gateway call happens inside the database transaction,
-// while the payment row is locked. It is simple to reason about (one executor per payment, the result and the
-// follow-up task commit together) but it holds a pooled connection and a row
+// while the payment row is locked. It is simple to reason about (one
+// executor per payment, the result and the follow-up task commit together) but it holds a pooled connection and a row
 // lock for the whole network round trip, and a crash between the gateway's
 // success and our commit leaves an outcome only the gateway knows. The
 // retry stays correct only because the gateway deduplicates by idempotency
@@ -42,6 +60,13 @@ func (s *Service) startInTx(ctx context.Context, id uuid.UUID) error {
 		}
 		if err != nil {
 			return fmt.Errorf("lock payment: %w", err)
+		}
+		// Decided under the row lock, which the two-phase tx1 also takes: a
+		// payment the two-phase start has touched is left to it.
+		if _, ok, err := s.attempts.Latest(ctx, id); err != nil {
+			return err
+		} else if ok {
+			return errHasAttempts
 		}
 		if p.Status != payment.StatusPending {
 			// Already started: a retry after a lost commit, or a gateway

@@ -24,8 +24,12 @@ func (s *Service) applyStatus(ctx context.Context, id uuid.UUID, status payment.
 		if err != nil {
 			return fmt.Errorf("lock payment: %w", err)
 		}
-		change, err = s.applyLocked(ctx, &p, status, ref)
-		return err
+		if change, err = s.applyLocked(ctx, &p, status, ref); err != nil {
+			return err
+		}
+		// A payment that has left pending with a gateway reference closes
+		// its open attempt, which a crash after the call may have left.
+		return s.settleOpenAttempt(ctx, p)
 	})
 	if err == nil {
 		s.report(change)

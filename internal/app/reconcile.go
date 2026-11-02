@@ -28,16 +28,22 @@ const (
 //     attempt is done;
 //   - none, with certainty: the call may still become visible, so the lookup
 //     repeats; after ReconcileNotFoundLimit answers the attempt is abandoned
-//     and a start task for the next attempt, with a new key, is enqueued;
-//   - several: the client may have been charged twice. That needs a person,
-//     so the task goes dead and the error is logged;
+//     and, below MaxGatewayAttempts, a start task for the next attempt with
+//     a new key is enqueued. At the cap the task goes dead for an operator;
+//   - several: the client was charged twice. That needs a person, so the
+//     task goes dead and the duplicate is counted;
 //   - the lookup fails: retried with backoff, never read as "none".
+//
+// Abandoning is safe only if the gateway's lookup shows a payment no later
+// than ReconcileInterval x ReconcileNotFoundLimit after the create call; the
+// duplicate check after the next attempt catches a payment that shows up
+// later.
 func (s *Service) ReconcilePayment(ctx context.Context, id uuid.UUID, payload json.RawMessage) error {
-	var in reconcilePayload
-	if err := json.Unmarshal(payload, &in); err != nil || in.Attempt < 1 {
-		return ports.Permanent(fmt.Errorf("decode reconcile payload %q: %v", payload, err))
+	n, err := decodeAttemptPayload(payload)
+	if err != nil {
+		return err
 	}
-	a, err := s.attempts.Get(ctx, id, in.Attempt)
+	a, err := s.attempts.Get(ctx, id, n)
 	if errors.Is(err, ports.ErrAttemptNotFound) {
 		return ports.Permanent(err)
 	}
@@ -57,23 +63,24 @@ func (s *Service) ReconcilePayment(ctx context.Context, id uuid.UUID, payload js
 	case 0:
 		return s.reconcileNotFound(ctx, a)
 	case 1:
-		if err := s.finishAttempt(ctx, a, found[0].Status, found[0].Ref); err != nil {
+		applied, err := s.finishAttempt(ctx, a, found[0].Status, found[0].Ref)
+		if err != nil {
 			return err
 		}
-		s.metrics.Reconciled(reconcileFound)
+		if applied {
+			s.metrics.Reconciled(reconcileFound)
+		}
 		return nil
 	default:
 		s.metrics.Reconciled(reconcileDuplicate)
-		s.log.ErrorContext(ctx, "gateway holds several payments for one bank payment",
-			"payment_id", id, "attempt", a.Number, "count", len(found))
-		return ports.Permanent(fmt.Errorf("gateway holds %d payments for reference %s", len(found), id))
+		return s.duplicateFound(ctx, id, a.Number, found)
 	}
 }
 
 // reconcileNotFound counts a certain "not found" answer and abandons the
 // attempt once the limit is reached.
 func (s *Service) reconcileNotFound(ctx context.Context, a ports.Attempt) error {
-	abandoned := false
+	var abandoned, capped bool
 	err := s.tx.Run(ctx, func(ctx context.Context) error {
 		p, err := s.payments.Lock(ctx, a.PaymentID)
 		if err != nil {
@@ -99,6 +106,10 @@ func (s *Service) reconcileNotFound(ctx context.Context, a ports.Attempt) error 
 		if p.Status != payment.StatusPending {
 			return nil // a gateway event moved the payment: nothing to restart
 		}
+		if cur.Number >= s.cfg.MaxGatewayAttempts {
+			capped = true
+			return nil
+		}
 		restart := ports.TaskSpec{
 			Kind:      ports.TaskStartPayment,
 			PaymentID: p.ID,
@@ -110,10 +121,15 @@ func (s *Service) reconcileNotFound(ctx context.Context, a ports.Attempt) error 
 		}
 		return nil
 	})
-	if err != nil {
+	switch {
+	case err != nil:
 		return err
-	}
-	if abandoned {
+	case capped:
+		s.metrics.Reconciled(reconcileAbandoned)
+		s.log.ErrorContext(ctx, "last gateway attempt abandoned; the payment stays pending and needs an operator",
+			"payment_id", a.PaymentID, "attempt", a.Number)
+		return ports.Permanent(fmt.Errorf("payment %s: %d gateway attempts abandoned, the cap", a.PaymentID, a.Number))
+	case abandoned:
 		s.metrics.Reconciled(reconcileAbandoned)
 		s.log.WarnContext(ctx, "gateway attempt abandoned after repeated not-found answers; starting a new attempt",
 			"payment_id", a.PaymentID, "attempt", a.Number)
@@ -121,4 +137,44 @@ func (s *Service) reconcileNotFound(ctx context.Context, a ports.Attempt) error 
 	}
 	s.metrics.Reconciled(reconcileNotFound)
 	return ports.RetryLater(s.cfg.ReconcileInterval, "gateway does not know the payment yet")
+}
+
+// CheckDuplicates runs after an attempt that followed an abandoned one has
+// settled, once the gateway had time to show a payment for the abandoned
+// key: the gateway must hold exactly one payment for our reference.
+// Several mean the client was charged twice; the task goes dead with the
+// gateway references in the log, and the refund is an operator action.
+func (s *Service) CheckDuplicates(ctx context.Context, id uuid.UUID, payload json.RawMessage) error {
+	n, err := decodeAttemptPayload(payload)
+	if err != nil {
+		return err
+	}
+	found, err := s.gateway.FindByReference(ctx, id.String())
+	if err != nil {
+		return fmt.Errorf("look up payment at gateway: %w", err)
+	}
+	switch len(found) {
+	case 0:
+		// The payment has a settled attempt, so the gateway's lookup lags:
+		// retry, and go dead after the task's attempts if it never shows.
+		return fmt.Errorf("gateway lookup shows no payment for reference %s yet", id)
+	case 1:
+		s.log.InfoContext(ctx, "no duplicate gateway payment", "payment_id", id, "attempt", n, "gateway_ref", found[0].Ref)
+		return nil
+	default:
+		return s.duplicateFound(ctx, id, n, found)
+	}
+}
+
+// duplicateFound records a double charge: counted, logged with what an
+// operator needs to refund it, and turned into a dead task.
+func (s *Service) duplicateFound(ctx context.Context, id uuid.UUID, attempt int, found []ports.GatewayPayment) error {
+	refs := make([]string, len(found))
+	for i, f := range found {
+		refs[i] = f.Ref
+	}
+	s.metrics.DuplicateDetected()
+	s.log.ErrorContext(ctx, "gateway holds several payments for one bank payment; refund the extra ones",
+		"payment_id", id, "attempt", attempt, "gateway_refs", refs, "count", len(found))
+	return ports.Permanent(fmt.Errorf("gateway holds %d payments for reference %s: %v", len(found), id, refs))
 }
