@@ -238,6 +238,7 @@ if two_phase; then
   at_least "reconcile counted the not-found answers" "$(metric 'reconcile_total{outcome="not_found"}')" 2
   at_least "reconcile abandoned the unexecuted attempt" "$(metric 'reconcile_total{outcome="abandoned"}')" 1
   expect "no duplicate charge detected" "$(metric gateway_duplicates_detected_total)" 0
+  expect "no charge for a failed payment detected" "$(metric gateway_charge_mismatches_total)" 0
   expect "no attempt left open" "$(metric 'gateway_attempts{state="unknown"}')" 0
   expect "no open attempt age" "$(metric gateway_attempt_oldest_open_seconds)" 0
 else
@@ -265,7 +266,7 @@ until [ "$(prom_query 'up{job="payments"}')" = 1 ]; do
 done
 ok "scrape target is up"
 expect "alert rule groups loaded" "$(curl -sS "$PROM/api/v1/rules" | jq '.data.groups | length')" 4
-expect "alert rules loaded" "$(curl -sS "$PROM/api/v1/rules" | jq '[.data.groups[].rules[]] | length')" 11
+expect "alert rules loaded" "$(curl -sS "$PROM/api/v1/rules" | jq '[.data.groups[].rules[]] | length')" 12
 deadline=$((SECONDS + 60))
 until curl -sS "$PROM/api/v1/alerts" | jq -e '.data.alerts[] | select(.labels.alertname == "GatewayMisconfigured")' >/dev/null; do
   [ $SECONDS -lt $deadline ] || fail "GatewayMisconfigured did not fire after the 401 answer"
@@ -274,6 +275,7 @@ done
 ok "GatewayMisconfigured fires after the 401 answer"
 expect "DeadTasks does not fire" "$(curl -sS "$PROM/api/v1/alerts" | jq '[.data.alerts[] | select(.labels.alertname == "DeadTasks")] | length')" 0
 expect "GatewayDuplicateCharge does not fire" "$(curl -sS "$PROM/api/v1/alerts" | jq '[.data.alerts[] | select(.labels.alertname == "GatewayDuplicateCharge")] | length')" 0
+expect "GatewayChargeMismatch does not fire" "$(curl -sS "$PROM/api/v1/alerts" | jq '[.data.alerts[] | select(.labels.alertname == "GatewayChargeMismatch")] | length')" 0
 
 log "==> graceful stop"
 docker compose stop payments >/dev/null

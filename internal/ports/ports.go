@@ -77,6 +77,10 @@ type Metrics interface {
 	// DuplicateDetected reports that the gateway holds more than one
 	// payment for one bank payment: the client was charged twice.
 	DuplicateDetected()
+	// ChargeMismatch reports that the gateway holds a charge our records do
+	// not show: an executed payment for a payment we report failed or
+	// canceled.
+	ChargeMismatch()
 }
 
 // Watcher lets a use case wait until a payment's version moves past a marker

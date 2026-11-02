@@ -42,6 +42,13 @@ groups:
         annotations:
           summary: "A gateway attempt has been open for more than five minutes"
           runbook: "Check reconcile_total{outcome=\"error\"} and the gateway lookup. If the attempt's reconcile_payment task is dead, fix the cause and requeue that task; re-running start_payment does not revive it."
+      - alert: GatewayChargeMismatch
+        expr: sum(increase(gateway_charge_mismatches_total[15m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "The gateway holds a charge for a payment we report failed or canceled"
+          runbook: "Find 'gateway holds a charge for a payment we report' in the logs for the payment id and gateway charges; refund the charge or correct the payment with the gateway, then close the dead task."
       - alert: GatewayDuplicateCharge
         expr: sum(increase(gateway_duplicates_detected_total[15m])) > 0
         labels:

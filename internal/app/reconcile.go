@@ -141,29 +141,83 @@ func (s *Service) reconcileNotFound(ctx context.Context, a ports.Attempt) error 
 
 // CheckDuplicates runs after an attempt that followed an abandoned one has
 // settled, once the gateway had time to show a payment for the abandoned
-// key: the gateway must hold exactly one payment for our reference.
-// Several mean the client was charged twice; the task goes dead with the
-// gateway references in the log, and the refund is an operator action.
+// key. It compares the charges the gateway holds for our reference (its
+// payments that are neither failed nor canceled) with our own record:
+//
+//   - we report failed or canceled: the gateway must hold no charge; one is
+//     a client charged although we said no;
+//   - we report a charge (the payment has a gateway reference): the gateway
+//     must hold exactly that one; another charge is a duplicate;
+//   - the gateway does not show our own reference yet: its lookup lags, the
+//     task retries;
+//   - the payment is still pending: checked again later.
+//
+// Both kinds of mismatch are counted, alerted and left as a dead task with
+// the gateway references in the log; the refund is an operator action.
 func (s *Service) CheckDuplicates(ctx context.Context, id uuid.UUID, payload json.RawMessage) error {
 	n, err := decodeAttemptPayload(payload)
 	if err != nil {
 		return err
 	}
+	p, err := s.payments.Payment(ctx, id)
+	if errors.Is(err, payment.ErrNotFound) {
+		return ports.Permanent(err)
+	}
+	if err != nil {
+		return fmt.Errorf("read payment: %w", err)
+	}
+	if !p.Status.Final() && p.GatewayRef == "" {
+		return ports.RetryLater(s.cfg.DuplicateCheckDelay, "payment "+string(p.Status)+" without a gateway reference")
+	}
 	found, err := s.gateway.FindByReference(ctx, id.String())
 	if err != nil {
 		return fmt.Errorf("look up payment at gateway: %w", err)
 	}
-	switch len(found) {
-	case 0:
-		// The payment has a settled attempt, so the gateway's lookup lags:
-		// retry, and go dead after the task's attempts if it never shows.
-		return fmt.Errorf("gateway lookup shows no payment for reference %s yet", id)
-	case 1:
-		s.log.InfoContext(ctx, "no duplicate gateway payment", "payment_id", id, "attempt", n, "gateway_ref", found[0].Ref)
-		return nil
-	default:
-		return s.duplicateFound(ctx, id, n, found)
+	var charges []ports.GatewayPayment
+	ours := false
+	for _, f := range found {
+		if f.Status == payment.StatusFailed || f.Status == payment.StatusCanceled {
+			continue // a declined or canceled gateway payment charges nothing
+		}
+		charges = append(charges, f)
+		if f.Ref == p.GatewayRef {
+			ours = true
+		}
 	}
+
+	reportedNoCharge := p.Status == payment.StatusFailed || p.Status == payment.StatusCanceled
+	switch {
+	case reportedNoCharge && len(charges) > 0:
+		return s.chargeMismatch(ctx, p, n, charges)
+	case reportedNoCharge:
+		s.log.InfoContext(ctx, "no gateway charge for a payment we report "+string(p.Status), "payment_id", id, "attempt", n)
+		return nil
+	case len(charges) > 1, len(charges) == 1 && !ours:
+		// Our charge and another one, or another one where ours should be.
+		return s.duplicateFound(ctx, id, n, charges)
+	case len(charges) == 0:
+		// Our payment has a reference the lookup does not show yet: retry,
+		// and go dead after the task's attempts if it never shows.
+		return fmt.Errorf("gateway lookup does not show payment %s (ref %s) yet", id, p.GatewayRef)
+	default:
+		s.log.InfoContext(ctx, "no duplicate gateway payment", "payment_id", id, "attempt", n, "gateway_ref", p.GatewayRef)
+		return nil
+	}
+}
+
+// chargeMismatch records a client charged for a payment we report failed or
+// canceled: counted, logged with what an operator needs, and turned into a
+// dead task.
+func (s *Service) chargeMismatch(ctx context.Context, p payment.Payment, attempt int, charges []ports.GatewayPayment) error {
+	refs := make([]string, len(charges))
+	for i, c := range charges {
+		refs[i] = c.Ref + ":" + string(c.Status)
+	}
+	s.metrics.ChargeMismatch()
+	s.log.ErrorContext(ctx, "gateway holds a charge for a payment we report "+string(p.Status)+"; refund it or correct the payment",
+		"payment", p, "attempt", attempt, "gateway_charges", refs)
+	return ports.Permanent(fmt.Errorf("gateway holds %d charge(s) for payment %s, which we report %s: %v",
+		len(charges), p.ID, p.Status, refs))
 }
 
 // duplicateFound records a double charge: counted, logged with what an

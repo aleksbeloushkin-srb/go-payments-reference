@@ -64,6 +64,23 @@ tests:
 
   - interval: 1m
     input_series:
+      - series: 'gateway_charge_mismatches_total{instance="a:9100", job="payments"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: GatewayChargeMismatch
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayChargeMismatch
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "The gateway holds a charge for a payment we report failed or canceled"
+              runbook: "Find 'gateway holds a charge for a payment we report' in the logs for the payment id and gateway charges; refund the charge or correct the payment with the gateway, then close the dead task."
+
+  - interval: 1m
+    input_series:
       - series: 'gateway_duplicates_detected_total{instance="a:9100", job="payments"}'
         values: '0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
     alert_rule_test:

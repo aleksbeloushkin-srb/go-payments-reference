@@ -309,6 +309,7 @@ type fakeMetrics struct {
 	changes    []string
 	reconciled []string
 	duplicates int
+	mismatches int
 }
 
 func (m *fakeMetrics) PaymentCreated() {
@@ -321,6 +322,12 @@ func (m *fakeMetrics) StatusChanged(from, to payment.Status, _ time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.changes = append(m.changes, string(from)+"->"+string(to))
+}
+
+func (m *fakeMetrics) ChargeMismatch() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mismatches++
 }
 
 func (m *fakeMetrics) DuplicateDetected() {

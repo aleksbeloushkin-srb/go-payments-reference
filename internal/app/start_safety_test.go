@@ -210,36 +210,155 @@ func TestAnswerForAbandonedAttemptChecksForDuplicates(t *testing.T) {
 	}
 }
 
+// The duplicate check compares the gateway's charges with our record.
 func TestCheckDuplicatesOutcomes(t *testing.T) {
 	payload, _ := json.Marshal(attemptPayload{Attempt: 2})
+	charge := func(ref string, st payment.Status) ports.GatewayPayment {
+		return ports.GatewayPayment{Ref: ref, Status: st}
+	}
 	tests := []struct {
-		name     string
-		found    []ports.GatewayPayment
-		findErr  error
-		wantErr  bool
-		wantPerm bool
+		name         string
+		status       payment.Status
+		ref          string
+		found        []ports.GatewayPayment
+		findErr      error
+		wantErr      bool
+		wantPerm     bool
+		wantLater    bool
+		wantDup      int
+		wantMismatch int
 	}{
-		{name: "one payment is fine", found: []ports.GatewayPayment{{Ref: "gw_1"}}},
-		{name: "lookup lags behind: retried", found: []ports.GatewayPayment{}, wantErr: true},
-		{name: "lookup fails: retried", findErr: ports.ErrGatewayUnavailable, wantErr: true},
-		{name: "two payments: dead", found: []ports.GatewayPayment{{Ref: "gw_1"}, {Ref: "gw_2"}}, wantErr: true, wantPerm: true},
+		{name: "our charge only", status: payment.StatusSucceeded, ref: "gw_1",
+			found: []ports.GatewayPayment{charge("gw_1", payment.StatusSucceeded)}},
+		{name: "a declined extra payment charges nothing", status: payment.StatusSucceeded, ref: "gw_1",
+			found: []ports.GatewayPayment{charge("gw_1", payment.StatusSucceeded), charge("gw_2", payment.StatusFailed)}},
+		{name: "two charges", status: payment.StatusSucceeded, ref: "gw_1",
+			found:   []ports.GatewayPayment{charge("gw_1", payment.StatusSucceeded), charge("gw_2", payment.StatusProcessing)},
+			wantErr: true, wantPerm: true, wantDup: 1},
+		{name: "lookup lags behind our charge: retried", status: payment.StatusSucceeded, ref: "gw_1",
+			found: []ports.GatewayPayment{}, wantErr: true},
+		{name: "lookup fails: retried", status: payment.StatusSucceeded, ref: "gw_1",
+			findErr: ports.ErrGatewayUnavailable, wantErr: true},
+		{name: "failed and nothing charged is correct", status: payment.StatusFailed,
+			found: []ports.GatewayPayment{}},
+		{name: "failed but the gateway holds a charge", status: payment.StatusFailed,
+			found:   []ports.GatewayPayment{charge("gw_1", payment.StatusSucceeded)},
+			wantErr: true, wantPerm: true, wantMismatch: 1},
+		{name: "canceled but the gateway shows our ref as charged", status: payment.StatusCanceled, ref: "gw_1",
+			found:   []ports.GatewayPayment{charge("gw_1", payment.StatusProcessing)},
+			wantErr: true, wantPerm: true, wantMismatch: 1},
+		{name: "still pending without a reference: later", status: payment.StatusPending,
+			wantErr: true, wantLater: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFixture(testConfig)
-			p := f.seed(payment.StatusSucceeded)
+			p := f.seed(tt.status)
+			q := f.store.payments[p.ID]
+			q.GatewayRef = tt.ref
+			f.store.payments[p.ID] = q
 			f.gateway.found, f.gateway.findErr = tt.found, tt.findErr
 
 			err := f.svc.CheckDuplicates(context.Background(), p.ID, payload)
 
 			var perm *ports.PermanentError
-			if (err != nil) != tt.wantErr || errors.As(err, &perm) != tt.wantPerm {
-				t.Fatalf("err = %v, wantErr %v, permanent %v", err, tt.wantErr, tt.wantPerm)
+			var later *ports.RetryLaterError
+			if (err != nil) != tt.wantErr || errors.As(err, &perm) != tt.wantPerm || errors.As(err, &later) != tt.wantLater {
+				t.Fatalf("err = %v, wantErr %v, permanent %v, later %v", err, tt.wantErr, tt.wantPerm, tt.wantLater)
 			}
-			if wantDup := tt.wantPerm; (f.metrics.duplicates == 1) != wantDup {
-				t.Fatalf("duplicates detected = %d", f.metrics.duplicates)
+			if f.metrics.duplicates != tt.wantDup || f.metrics.mismatches != tt.wantMismatch {
+				t.Fatalf("duplicates = %d, mismatches = %d; want %d and %d", f.metrics.duplicates, f.metrics.mismatches, tt.wantDup, tt.wantMismatch)
 			}
 		})
+	}
+}
+
+// decliningGateway declines every create once decline is set, without
+// executing anything.
+type decliningGateway struct {
+	*laggingGateway
+	decline bool
+}
+
+func (g *decliningGateway) CreatePayment(ctx context.Context, req ports.GatewayRequest) (ports.GatewayPayment, error) {
+	if g.decline {
+		return ports.GatewayPayment{}, ports.ErrGatewayRejected
+	}
+	return g.laggingGateway.CreatePayment(ctx, req)
+}
+
+// abandonFirstAttempt runs an ambiguous attempt 1 through the not-found
+// limit, so that it is abandoned.
+func abandonFirstAttempt(t *testing.T, f *fixture, p payment.Payment) {
+	t.Helper()
+	if err := f.svc.StartPayment(context.Background(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	for range testConfig.ReconcileNotFoundLimit {
+		_ = reconcile(t, f, p.ID, 1)
+	}
+	if states := f.store.attemptStates(p.ID); !slices.Equal(states, []ports.AttemptState{ports.AttemptAbandoned}) {
+		t.Fatalf("attempts = %v, want attempt 1 abandoned", states)
+	}
+}
+
+// Attempt 1 executes late (after it was abandoned) and attempt 2 is
+// declined: we report failed while the client was charged. The duplicate
+// check must report that, not "no duplicate".
+func TestLateExecutionThenDeclinedNextAttemptIsAnIncident(t *testing.T) {
+	f := newFixture(testConfig)
+	gw := &decliningGateway{laggingGateway: &laggingGateway{dedupGateway: newDedupGateway(), ambiguous: true}}
+	f.svc.gateway = gw
+	p := f.seed(payment.StatusPending)
+	abandonFirstAttempt(t, f, p)
+
+	gw.decline = true // issuers often decline a repeated identical charge
+	if err := f.svc.StartPayment(context.Background(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.store.payments[p.ID].Status; got != payment.StatusFailed {
+		t.Fatalf("status = %s, want failed", got)
+	}
+	checks := f.store.tasksOf(ports.TaskCheckDuplicates)
+	if len(checks) != 1 {
+		t.Fatalf("duplicate checks = %d, want 1", len(checks))
+	}
+
+	gw.visible = true // the late payment for attempt 1 shows up
+	err := f.svc.CheckDuplicates(context.Background(), p.ID, checks[0].Payload)
+
+	var perm *ports.PermanentError
+	if !errors.As(err, &perm) || f.metrics.mismatches != 1 {
+		t.Fatalf("err = %v, mismatches = %d; want a dead task and one mismatch", err, f.metrics.mismatches)
+	}
+	if gw.executions() != 1 {
+		t.Fatalf("executions = %d, want the one late charge", gw.executions())
+	}
+}
+
+// Attempt 1 is abandoned without executing and attempt 2 is declined: the
+// gateway correctly holds nothing, and the check must not page anyone.
+func TestNothingExecutedThenDeclinedIsCorrect(t *testing.T) {
+	f := newFixture(testConfig)
+	p := f.seed(payment.StatusPending)
+	f.gateway.createErr = ports.ErrGatewayAmbiguous
+	f.gateway.found = []ports.GatewayPayment{}
+	abandonFirstAttempt(t, f, p)
+
+	f.gateway.createErr = ports.ErrGatewayRejected
+	if err := f.svc.StartPayment(context.Background(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	checks := f.store.tasksOf(ports.TaskCheckDuplicates)
+	if len(checks) != 1 {
+		t.Fatalf("duplicate checks = %d, want 1", len(checks))
+	}
+
+	if err := f.svc.CheckDuplicates(context.Background(), p.ID, checks[0].Payload); err != nil {
+		t.Fatalf("err = %v, want nil: nothing was charged", err)
+	}
+	if f.metrics.duplicates != 0 || f.metrics.mismatches != 0 {
+		t.Fatalf("duplicates = %d, mismatches = %d; want none", f.metrics.duplicates, f.metrics.mismatches)
 	}
 }
 

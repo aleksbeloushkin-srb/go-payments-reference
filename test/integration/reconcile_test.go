@@ -117,8 +117,11 @@ func TestReconcileDuplicateOnPostgres(t *testing.T) {
 	if err := e.svc.ReconcilePayment(context.Background(), p.ID, attemptPayload(1)); !errors.As(err, &perm) {
 		t.Fatalf("err = %v, want permanent", err)
 	}
-	if err := e.svc.CheckDuplicates(context.Background(), p.ID, attemptPayload(1)); !errors.As(err, &perm) {
-		t.Fatalf("duplicate check err = %v, want permanent", err)
+	// The payment is still pending without a reference: the duplicate check
+	// waits for an outcome to compare with.
+	var later *ports.RetryLaterError
+	if err := e.svc.CheckDuplicates(context.Background(), p.ID, attemptPayload(1)); !errors.As(err, &later) {
+		t.Fatalf("duplicate check err = %v, want RetryLater", err)
 	}
 }
 
