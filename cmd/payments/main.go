@@ -75,10 +75,11 @@ func main() {
 //  1. readiness turns false, so the load balancer stops sending traffic, and
 //     the worker stops claiming new tasks (running ones continue);
 //  2. a short pause lets the readiness change propagate;
-//  3. the HTTP server drains in-flight requests (long polls are released
+//  3. the API server drains in-flight requests (long polls are released
 //     at once by closing the waiter registry);
 //  4. background components stop: the worker finishes its running tasks;
-//  5. the database pool closes (deferred, after everything that uses it).
+//  5. the admin listener (metrics, probes) stops;
+//  6. the database pool closes (deferred, after everything that uses it).
 //
 // After the first signal the default handler is restored, so a second
 // signal kills the process immediately.
@@ -181,23 +182,28 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 		bg.Go("relay", relay.Run)
 	}
 
-	// HTTP.
+	// HTTP. The admin listener (metrics and probes) runs in every role; the
+	// API only with the api role. Both listen synchronously, so a busy port
+	// fails the start instead of a goroutine later.
 	var ready platform.Readiness
-	var srv *http.Server
-	serveErr := make(chan error, 1)
+	admin, err := startServer("admin", httpapi.NewServer(adminServerConfig(cfg.AdminAddr),
+		httpapi.NewAdminHandler(reg, ready.Ready, log), log))
+	if err != nil {
+		return errors.Join(err, bg.Stop())
+	}
+	var api *server
 	if cfg.Roles.API {
 		handler := httpapi.NewHandler(httpapi.Deps{
 			Creator:       svc,
 			Reader:        svc,
 			Events:        svc,
-			Ready:         ready.Ready,
 			WebhookSecret: []byte(cfg.WebhookSecret),
 			Static:        web.FS,
 			Clock:         clock,
 			Metrics:       httpapi.NewMetrics(reg),
 			Logger:        log,
 		})
-		srv = httpapi.NewServer(httpapi.ServerConfig{
+		srv := httpapi.NewServer(httpapi.ServerConfig{
 			Addr:              cfg.HTTPAddr,
 			ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 			ReadTimeout:       cfg.HTTPReadTimeout,
@@ -205,63 +211,116 @@ func run(ctx context.Context, stopSignals context.CancelFunc, cfg platform.Confi
 			IdleTimeout:       cfg.HTTPIdleTimeout,
 		}, handler, log)
 		srv.RegisterOnShutdown(waiters.Close)
-
-		// Listen synchronously so a busy port fails the start instead of a
-		// goroutine later.
-		ln, err := net.Listen("tcp", cfg.HTTPAddr)
-		if err != nil {
-			return errors.Join(fmt.Errorf("listen: %w", err), bg.Stop())
+		if api, err = startServer("api", srv); err != nil {
+			return errors.Join(err, admin.stop(ctx, adminShutdownTimeout), bg.Stop())
 		}
-		go func() { serveErr <- srv.Serve(ln) }()
 	}
 	ready.Set(true)
-	log.Info("payments started", "roles", cfg.Roles, "addr", cfg.HTTPAddr)
+	log.Info("payments started", "roles", cfg.Roles, "addr", cfg.HTTPAddr, "admin_addr", cfg.AdminAddr)
 
+	var apiDone <-chan struct{} // nil without the api role: never ready
+	if api != nil {
+		apiDone = api.done
+	}
 	var runErr error
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown requested", "cause", context.Cause(ctx))
-	case err := <-serveErr:
-		runErr = fmt.Errorf("http server: %w", err)
+	case <-apiDone:
+		runErr = fmt.Errorf("api server stopped: %w", api.err)
+	case <-admin.done:
+		runErr = fmt.Errorf("admin server stopped: %w", admin.err)
 	case <-bg.Done():
 		runErr = errors.New("a background component stopped")
 	}
 	stopSignals()
 
-	return errors.Join(runErr, shutdown(ctx, cfg, log, &ready, srv, serveErr, bg, stopClaiming))
+	return errors.Join(runErr, shutdown(ctx, cfg, log, &ready, api, admin, bg, stopClaiming))
 }
 
 func shutdown(ctx context.Context, cfg platform.Config, log *slog.Logger, ready *platform.Readiness,
-	srv *http.Server, serveErr <-chan error, bg *platform.Group, stopClaiming func()) error {
+	api, admin *server, bg *platform.Group, stopClaiming func()) error {
 	var errs []error
 	ready.Set(false)
 	// No new tasks from here on; running ones finish while HTTP drains.
 	stopClaiming()
-	if srv != nil {
+	if api != nil {
 		log.Info("draining: readiness is off", "pause", cfg.ShutdownDrainDelay)
 		pause := time.NewTimer(cfg.ShutdownDrainDelay)
 		<-pause.C
-
-		// A fresh deadline: ctx is already cancelled, and Shutdown with a
-		// cancelled context would return at once without draining.
-		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
-		defer cancel()
-		if err := srv.Shutdown(sctx); err != nil {
-			errs = append(errs, fmt.Errorf("http shutdown: %w", err))
-			_ = srv.Close()
+		if err := api.stop(ctx, cfg.ShutdownTimeout); err != nil {
+			errs = append(errs, err)
 		}
-		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errs = append(errs, fmt.Errorf("http server: %w", err))
-		}
-		log.Info("http server stopped")
+		log.Info("api server stopped")
 	}
 	if err := bg.Stop(); err != nil {
 		errs = append(errs, err)
 	}
 	log.Info("background components stopped")
+	// The admin listener goes last: probes and metrics stay available while
+	// everything else drains.
+	if err := admin.stop(ctx, adminShutdownTimeout); err != nil {
+		errs = append(errs, err)
+	}
 	// The deferred pool.Close in run comes next. slog writes synchronously
 	// to stdout, so there is no log buffer to flush; with an asynchronous
 	// handler, flushing it would be the very last step.
+	return errors.Join(errs...)
+}
+
+// adminShutdownTimeout bounds the admin listener's drain: a scrape or a
+// probe takes milliseconds.
+const adminShutdownTimeout = 5 * time.Second
+
+func adminServerConfig(addr string) httpapi.ServerConfig {
+	return httpapi.ServerConfig{
+		Addr:              addr,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+}
+
+// server is an http.Server whose Serve runs in its own goroutine.
+type server struct {
+	srv  *http.Server
+	name string
+	done chan struct{} // closed when Serve returns
+	err  error         // Serve's result; read it only after done is closed
+}
+
+// startServer listens on srv.Addr and serves in a new goroutine owned by the
+// returned server; stop waits for it.
+func startServer(name string, srv *http.Server) (*server, error) {
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("%s listen: %w", name, err)
+	}
+	s := &server{srv: srv, name: name, done: make(chan struct{})}
+	go func() {
+		defer close(s.done)
+		s.err = s.srv.Serve(ln)
+	}()
+	return s, nil
+}
+
+// stop drains the server within timeout, closes it if the drain does not
+// finish, and waits until Serve has returned. The deadline is fresh: the
+// signal context is already cancelled, and Shutdown with a cancelled context
+// would return at once without draining.
+func (s *server) stop(ctx context.Context, timeout time.Duration) error {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	var errs []error
+	if err := s.srv.Shutdown(sctx); err != nil {
+		errs = append(errs, fmt.Errorf("%s shutdown: %w", s.name, err))
+		_ = s.srv.Close()
+	}
+	<-s.done
+	if s.err != nil && !errors.Is(s.err, http.ErrServerClosed) {
+		errs = append(errs, fmt.Errorf("%s server: %w", s.name, s.err))
+	}
 	return errors.Join(errs...)
 }
 
@@ -306,12 +365,12 @@ func newPublisher(cfg platform.Config, log *slog.Logger) outbox.Publisher {
 	return outbox.Fanout{logPub, publisher.NewWebhook(cfg.EventsWebhookURL, platform.NewHTTPClient())}
 }
 
-// healthcheck probes /readyz. Distroless images have no curl, so the
-// container health check runs the binary itself.
+// healthcheck probes /readyz on the admin listener. Distroless images have
+// no curl, so the container health check runs the binary itself.
 func healthcheck() int {
-	addr := os.Getenv("PAYMENTS_HTTP_ADDR")
+	addr := os.Getenv("PAYMENTS_ADMIN_ADDR")
 	if addr == "" {
-		addr = ":8080"
+		addr = ":9100"
 	}
 	port := addr[strings.LastIndexByte(addr, ':')+1:]
 	client := &http.Client{Timeout: 2 * time.Second}

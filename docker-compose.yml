@@ -44,6 +44,9 @@ services:
       PAYMENTS_ROLES: api,worker,relay
     ports:
       - "8080:8080"
+      # Admin listener: /metrics, /healthz, /readyz. Published for local use
+      # only; in a real deployment it stays on the cluster network.
+      - "9100:9100"
     healthcheck:
       test: ["CMD", "/payments", "healthcheck"]
       interval: 2s

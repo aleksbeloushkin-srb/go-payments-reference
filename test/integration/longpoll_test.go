@@ -27,7 +27,6 @@ func startAPI(t *testing.T, e *env) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(httpapi.NewHandler(httpapi.Deps{
 		Creator: e.svc, Reader: e.svc, Events: e.svc,
-		Ready:         func() bool { return true },
 		WebhookSecret: []byte("0123456789abcdef"),
 		Static:        fstest.MapFS{},
 		Clock:         e.clock,

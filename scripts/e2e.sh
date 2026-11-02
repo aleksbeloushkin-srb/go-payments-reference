@@ -11,6 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 API=${API:-http://localhost:8080}
+ADMIN=${ADMIN:-http://localhost:9100}
 GW=${GW:-http://localhost:9090}
 KEEP=${KEEP:-0}
 
@@ -80,7 +81,7 @@ docker compose build payments
 docker compose up -d --wait
 
 log "==> service and web UI"
-expect "readyz" "$(curl -sS -o /dev/null -w '%{http_code}' "$API/readyz")" 200
+expect "readyz on the admin port" "$(curl -sS -o /dev/null -w '%{http_code}' "$ADMIN/readyz")" 200
 curl -sS "$API/" | grep -q "Pinkponies Bank" || fail "web UI does not render"
 ok "web UI page"
 for asset in app.js style.css logo.svg; do

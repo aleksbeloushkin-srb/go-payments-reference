@@ -26,7 +26,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.HTTPWriteTimeout <= cfg.WaitTimeout {
 		t.Fatal("default write timeout must exceed the long-poll soft timeout")
 	}
-	if cfg.WaitTimeout != 15*time.Second || cfg.TaskLease != time.Minute {
+	if cfg.WaitTimeout != 15*time.Second || cfg.TaskLease != time.Minute || cfg.AdminAddr != ":9100" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
@@ -50,6 +50,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		{"idle in tx", []string{"PAYMENTS_DB_IDLE_IN_TX_TIMEOUT=30s"}, "DB_IDLE_IN_TX_TIMEOUT must exceed"},
 		{"short secret", []string{"PAYMENTS_WEBHOOK_SECRET=short"}, "WEBHOOK_SECRET must be at least 16"},
 		{"bad gateway url", []string{"PAYMENTS_GATEWAY_URL=localhost:9090"}, "GATEWAY_URL must be an http(s) URL"},
+		{"admin on the api port", []string{"PAYMENTS_ADMIN_ADDR=:8080"}, "ADMIN_ADDR must differ from HTTP_ADDR"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -77,7 +77,6 @@ func newTestHandler(svc *fakeService, logs io.Writer) http.Handler {
 		Creator:       svc,
 		Reader:        svc,
 		Events:        svc,
-		Ready:         func() bool { return true },
 		WebhookSecret: secret,
 		Static:        staticFS,
 		Clock:         fixedClock{},
@@ -148,7 +147,7 @@ func TestMiddlewareOrder(t *testing.T) {
 func TestRequestIDIsKeptOnlyWhenWellFormed(t *testing.T) {
 	h := newTestHandler(&fakeService{}, io.Discard)
 	for incoming, keep := range map[string]bool{"abc-123": true, "bad id with spaces": false, "": false} {
-		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Header.Set(requestIDHeader, incoming)
 		got := do(h, req).Header().Get(requestIDHeader)
 		if (got == incoming) != keep || got == "" {
@@ -312,27 +311,38 @@ func TestGatewayEvent(t *testing.T) {
 	})
 }
 
-func TestStaticAndHealth(t *testing.T) {
+func TestStaticUIAndNoOperatorEndpoints(t *testing.T) {
 	h := newTestHandler(&fakeService{}, io.Discard)
 	if rec := do(h, httptest.NewRequest(http.MethodGet, "/", nil)); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "bank") {
 		t.Fatalf("GET / = %d %s", rec.Code, rec.Body)
 	}
-	if rec := do(h, httptest.NewRequest(http.MethodGet, "/readyz", nil)); rec.Code != http.StatusOK {
-		t.Fatalf("readyz = %d", rec.Code)
-	}
-	if rec := do(h, httptest.NewRequest(http.MethodGet, "/debug/vars", nil)); rec.Code != http.StatusNotFound {
-		t.Fatalf("debug/vars = %d, want 404: metrics live on the admin listener", rec.Code)
+	// Metrics and probes live on the admin listener, not on the public API.
+	for _, path := range []string{"/metrics", "/readyz", "/debug/vars"} {
+		if rec := do(h, httptest.NewRequest(http.MethodGet, path, nil)); rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s on the API = %d, want 404", path, rec.Code)
+		}
 	}
 }
 
-func TestReadyzReportsNotReady(t *testing.T) {
-	h := NewHandler(Deps{
-		Creator: &fakeService{}, Reader: &fakeService{}, Events: &fakeService{},
-		Ready: func() bool { return false }, WebhookSecret: secret, Static: staticFS,
-		Clock: fixedClock{}, Metrics: NewMetrics(prometheus.NewRegistry()), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+func TestAdminHandler(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewMetrics(reg).requests.WithLabelValues("/v1/payments", "POST", "201").Inc()
+	ready := false
+	h := NewAdminHandler(reg, func() bool { return ready }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rec := do(h, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `http_requests_total{code="201",method="POST",route="/v1/payments"} 1`) {
+		t.Fatalf("GET /metrics = %d\n%s", rec.Code, rec.Body)
+	}
+	if rec := do(h, httptest.NewRequest(http.MethodGet, "/healthz", nil)); rec.Code != http.StatusOK {
+		t.Fatalf("healthz = %d", rec.Code)
+	}
 	if rec := do(h, httptest.NewRequest(http.MethodGet, "/readyz", nil)); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("readyz = %d, want 503", rec.Code)
+		t.Fatalf("readyz before start = %d, want 503", rec.Code)
+	}
+	ready = true
+	if rec := do(h, httptest.NewRequest(http.MethodGet, "/readyz", nil)); rec.Code != http.StatusOK {
+		t.Fatalf("readyz = %d, want 200", rec.Code)
 	}
 }
 
@@ -376,7 +386,7 @@ func TestRequestMetrics(t *testing.T) {
 	m := NewMetrics(reg)
 	svc := &fakeService{waitRes: app.WaitResult{Payment: sample}}
 	h := NewHandler(Deps{
-		Creator: svc, Reader: svc, Events: svc, Ready: func() bool { return true },
+		Creator: svc, Reader: svc, Events: svc,
 		WebhookSecret: secret, Static: staticFS, Clock: fixedClock{}, Metrics: m,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})

@@ -34,6 +34,7 @@ type Config struct {
 	Roles    Roles
 
 	HTTPAddr              string
+	AdminAddr             string
 	HTTPReadHeaderTimeout time.Duration
 	HTTPReadTimeout       time.Duration
 	HTTPWriteTimeout      time.Duration
@@ -88,6 +89,8 @@ func LoadConfig(environ []string) (Config, error) {
 		Roles: l.roles("ROLES", "api,worker,relay"),
 
 		HTTPAddr: l.str("HTTP_ADDR", ":8080"),
+		// Metrics and probes, for the cluster network only.
+		AdminAddr: l.str("ADMIN_ADDR", ":9100"),
 		// Slow-header clients cannot pin connections for long.
 		HTTPReadHeaderTimeout: l.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
 		// Request bodies are a few hundred bytes.
@@ -205,6 +208,9 @@ func (c Config) validate() error {
 	check(c.WaitMaxWaiters >= 1, "%sWAIT_MAX_WAITERS must be at least 1", envPrefix)
 	check(c.RelayBatch >= 1, "%sRELAY_BATCH must be at least 1", envPrefix)
 	check(c.DatabaseURL != "", "%sDATABASE_URL is required", envPrefix)
+	check(c.AdminAddr != "", "%sADMIN_ADDR is required", envPrefix)
+	check(!c.Roles.API || c.AdminAddr != c.HTTPAddr,
+		"%sADMIN_ADDR must differ from HTTP_ADDR: metrics and probes need their own listener", envPrefix)
 	check(c.TaskRetryBase <= c.TaskRetryMax, "%sTASK_RETRY_BASE must not exceed TASK_RETRY_MAX", envPrefix)
 
 	// Relations between settings: each one guards a failure mode.
